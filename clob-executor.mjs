@@ -36,11 +36,18 @@ async function initClobClient() {
 
   // Try to import the official SDK, fall back to raw API calls
   try {
-    const { ClobClient } = await import('@polymarket/clob-client-v2');
+    const { ClobClient, SignatureTypeV2 } = await import('@polymarket/clob-client-v2');
+    const sigType = CONFIG.execution.signatureType === 3 ? SignatureTypeV2.POLY_1271
+      : CONFIG.execution.signatureType === 2 ? SignatureTypeV2.POLY_GNOSIS_SAFE
+      : CONFIG.execution.signatureType === 1 ? SignatureTypeV2.POLY_PROXY
+      : SignatureTypeV2.EOA;
+
     const tempClient = new ClobClient({
       host: CONFIG.api.clob,
       chain: CONFIG.api.chainId,
       signer: walletClient,
+      signatureType: sigType,
+      funderAddress: CONFIG.execution.funderAddress || account.address,
     });
     apiCreds = await tempClient.createOrDeriveApiKey();
 
@@ -49,10 +56,10 @@ async function initClobClient() {
       chain: CONFIG.api.chainId,
       signer: walletClient,
       creds: apiCreds,
-      signatureType: CONFIG.execution.signatureType,
+      signatureType: sigType,
       funderAddress: CONFIG.execution.funderAddress || account.address,
     });
-    console.log('✅ CLOB client initialized with official SDK');
+    console.log('✅ CLOB client initialized with official SDK (sigType:', sigType + ')');
   } catch (sdkErr) {
     console.warn('⚠️  Polymarket SDK not available, using raw API mode');
     console.warn(`   ${sdkErr.message}`);

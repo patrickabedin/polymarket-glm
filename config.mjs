@@ -69,7 +69,7 @@ export const CONFIG = {
     // Wallet (MUST be set via env)
     privateKey: process.env.POLY_PRIVATE_KEY || '',
     funderAddress: process.env.POLY_FUNDER_ADDRESS || '',
-    signatureType: 0,                    // 0 = EOA, 3 = deposit wallet
+    signatureType: 3,                    // 3 = POLY_1271 (EIP-1271 smart contract wallet)
   },
 
   // ── Layer 4: Risk Management ──────────────────────────────────────────────────
