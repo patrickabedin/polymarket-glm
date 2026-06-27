@@ -51,7 +51,7 @@ export const CONFIG = {
   // ── Layer 3: Execution ────────────────────────────────────────────────────────
   execution: {
     enabled: true,                       // auto-trade (Patrick said "must auto trade")
-    copyRatio: 0.10,                     // copy 10% of whale's position size
+    copyRatio: 0.05,                     // copy 5% of whale's position size
     slippageBuffer: 0.02,                // limit order 2% above whale's entry
     orderType: 'GTC',                    // Good-til-cancelled limit orders
     fillTimeoutMin: 30,                  // cancel if not filled in 30min
@@ -74,13 +74,13 @@ export const CONFIG = {
 
   // ── Layer 4: Risk Management ──────────────────────────────────────────────────
   risk: {
-    maxPositionSizeUsd: 50,             // max $50 per trade
-    maxDailyTrades: 10,
-    maxConcurrentPositions: 10,
+    maxPositionSizeUsd: 5,              // max $5 per trade (5% of $99 bankroll)
+    maxDailyTrades: 5,
+    maxConcurrentPositions: 8,
     maxConcurrentPerCategory: 3,         // max 3 in same category
     maxPortfolioDrawdownPct: 0.15,      // pause if drawdown >15%
     minBalanceUsd: 10,                   // stop if balance < $10
-    dailyLossLimitUsd: 50,              // stop trading if daily loss > $50
+    dailyLossLimitUsd: 15,              // stop trading if daily loss > $15
     cooldownAfterLossMin: 30,           // 30min cooldown after a loss
   },
 
