@@ -5,6 +5,7 @@
 
 import { CONFIG } from './config.mjs';
 import { Data, Gamma, retry, rateLimited } from './polymarket-api.mjs';
+import { scoreWalletV2 } from './whale-scoring-v2.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -186,9 +187,9 @@ export async function discoverWhales() {
   const filtered = filterWhales(analyzed);
   console.log(`✅ ${filtered.length}/${analyzed.length} wallets pass quality filters`);
 
-  // 4. Score and rank
+  // 4. Score and rank (using enhanced V2 scoring with 10 dimensions)
   const scored = filtered.map(w => {
-    const { score, components } = scoreWallet(w.stats);
+    const { score, components } = scoreWalletV2(w.stats, w.profile || null, w.stats.closedPositions || null);
     return { ...w, score, scoreComponents: components };
   }).sort((a, b) => b.score - a.score);
 

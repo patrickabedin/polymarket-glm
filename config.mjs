@@ -1,8 +1,7 @@
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 //  POLYMARKET WHALE COPY TRADER — Configuration
 //  All 5 layers in one engine: Discovery → Monitor → Execute → Risk → Alerts
-// ═══════════════════════════════════════════════════════════════════════════════
-
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 export const CONFIG = {
   // ── Layer 1: Whale Discovery ──────────────────────────────────────────────────
   discovery: {
@@ -48,7 +47,7 @@ export const CONFIG = {
     minMarketLiquidity: 5000,            // market must have ≥$5k liquidity
   },
 
-  // ── Layer 3: Execution ────────────────────────────────────────────────────────
+  // ── Layer 3: Execution ────────────────────────────────────────────────────
   execution: {
     enabled: true,                       // auto-trade (Patrick said "must auto trade")
     copyRatio: 0.05,                     // copy 5% of whale's position size
@@ -105,13 +104,50 @@ export const CONFIG = {
     chainId: 137,                        // Polygon mainnet
   },
 
-  // ── Moralis (on-chain) ────────────────────────────────────────────────────────
+  // ── Moralis (on-chain) ────────────────────────────────────────────
   moralis: {
     apiKey: process.env.MORALIS_API_KEY || '',
     chain: 'polygon',
+    // pUSD flow tracking
+    pusdTracking: {
+      enabled: true,
+      pollIntervalSec: 60,
+      minDepositAlertUsd: 100,
+    },
+    // Wallet profiling
+    walletProfiling: {
+      enabled: true,
+      refreshIntervalHours: 24, // re-profile daily
+    },
   },
 
-  // ── State ──────────────────────────────────────────────────────────────────────
+  // ── Multi-Source Discovery ─────────────────────────────────────────────────────
+  multiSource: {
+    enabled: true,
+    // Sources to use (all enabled by default)
+    sources: ['leaderboard', 'holders', 'onchain', 'social'],
+    // Confluence bonuses
+    confluenceBonus: {
+      twoSources: 0.20,    // +20%
+      threePlusSources: 0.40, // +40%
+    },
+    // Holders discovery
+    holdersMinMarkets: 3,        // wallet must be in 3+ winning market holders
+    holdersMinMarketVolume: 10000,
+    // On-chain discovery
+    onchainMinRedemptions: 3,    // wallet must have 3+ redemptions
+    onchainMinTotalUsd: 1000,    // and $1000+ total redeemed
+  },
+
+  // ── PnL Logger ─────────────────────────────────────────────────────────
+  pnlLogger: {
+    enabled: true,
+    dailySummaryHour: 8, // 08:00 UTC
+    tradeLogFile: 'data/pnl_log.jsonl',
+    dailyLogFile: 'data/pnl_daily.jsonl',
+  },
+
+  // ── State ──────────────────────────────────────────────────────────────
   state: {
     dir: './data',
     whaleDb: 'data/whales.json',

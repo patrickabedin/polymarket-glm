@@ -7,6 +7,7 @@ import { CONFIG } from './config.mjs';
 import { CLOB, Gamma, retry, rateLimited } from './polymarket-api.mjs';
 import { checkRisk, registerTrade, registerExit, getOpenPositions, updatePositionPrice } from './risk-manager.mjs';
 import { sendTelegram } from './telegram-bot.mjs';
+import { logTrade, logExit } from './pnl-logger.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -193,6 +194,16 @@ export async function executeSignal(signal) {
 
     registerTrade(trade);
 
+    // Log to PnL logger
+    if (CONFIG.pnlLogger.enabled) {
+      logTrade({
+        ...trade,
+        market: market.title,
+        conditionId: market.conditionId,
+        whaleEntryPrice: whaleEntryPrice,
+      });
+    }
+
     // Alert
     if (CONFIG.telegram.alertOnTrade) {
       const consensusNote = consensus
@@ -305,6 +316,11 @@ async function exitPosition(pos, size, price, reason) {
   try {
     const order = await placeOrder(pos.tokenId, 'SELL', price, size, pos.marketData);
     registerExit(pos.orderId, { size, price, reason, sellOrderId: order.orderID });
+
+    // Log exit to PnL logger
+    if (CONFIG.pnlLogger.enabled) {
+      logExit(pos.orderId, { size, price, reason, sellOrderId: order.orderID });
+    }
 
     if (CONFIG.telegram.alertOnExit) {
       const pnl = (price - pos.entryPrice) * size;

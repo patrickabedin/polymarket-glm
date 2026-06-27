@@ -8,7 +8,7 @@
     "start": "node index.mjs",
     "discover": "node whale-discovery.mjs",
     "monitor": "node signal-monitor.mjs",
-    "test": "node --check index.mjs && node --check whale-discovery.mjs && node --check signal-monitor.mjs && node --check clob-executor.mjs && node --check risk-manager.mjs && echo 'All files syntax OK'"
+    "test"    "test": "node --check index.mjs && node --check whale-discovery.mjs && node --check signal-monitor.mjs && node --check clob-executor.mjs && node --check risk-manager.mjs && node --check moralis-pusd-tracker.mjs && node --check moralis-wallet-profiler.mjs && node --check whale-scoring-v2.mjs && node --check pnl-logger.mjs && node --check whale-sources-v2.mjs && echo 'All files syntax OK'"
   },
   "dependencies": {
     "viem": "^2.0.0",
