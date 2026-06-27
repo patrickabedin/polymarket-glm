@@ -86,8 +86,9 @@ export function logExit(tradeId, exitDetails) {
   if (entry) {
     const entryCost = entry.costUsd || (entry.entryPrice * entry.size);
     const exitValue = exitDetails.price * (exitDetails.size || entry.size);
-    const pnlUsd = exitValue - (entryCost * ((exitDetails.size || entry.size) / entry.size));
-    const pnlPct = entryCost > 0 ? (pnlUsd / (entryCost * ((exitDetails.size || entry.size) / entry.size))) * 100 : 0;
+    const sizeRatio = entry.size > 0 ? ((exitDetails.size || entry.size) / entry.size) : 1;
+    const pnlUsd = exitValue - (entryCost * sizeRatio);
+    const pnlPct = entryCost > 0 ? (pnlUsd / (entryCost * sizeRatio)) * 100 : 0;
 
     const entryTime = new Date(entry.timestamp).getTime();
     const exitTime = new Date(exitRecord.exitTimestamp).getTime();

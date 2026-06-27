@@ -117,6 +117,7 @@ async function analyzeWallet(address) {
       sizingScore,
       timingAccuracy,
       portfolioValue: value?.value || 0,
+      closedPositions: resolved,  // raw closed positions for v2 scoring
     };
   } catch (err) {
     console.warn(`⚠️  Failed to analyze ${address}: ${err.message}`);

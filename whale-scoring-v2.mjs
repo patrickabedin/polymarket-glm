@@ -138,7 +138,6 @@ export function scoreWalletV2(stats, profile = null, closedPositions = null) {
 
   const timingScore = (stats.timingAccuracy || 0) * MAX_POINTS.timingAccuracy;
 
-  const sizingScore = (stats.sizingScore || 0) * MAX_POINTS.consistency || 0;
   const sizingNormalized = (stats.sizingScore || 0) * MAX_POINTS.sizingConsistency;
 
   const specScore = (stats.specialization || 0) * MAX_POINTS.categorySpecialization;
