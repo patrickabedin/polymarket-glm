@@ -5,9 +5,9 @@
 
 import { CONFIG } from './config.mjs';
 import { CLOB, Gamma, retry, rateLimited } from './polymarket-api.mjs';
-import { checkRisk, registerTrade, registerExit, getOpenPositions, updatePositionPrice } from './risk-manager.mjs';
+import { checkRisk, registerTrade, registerExit, getOpenPositions, updatePositionPrice, updatePositionStatus } from './risk-manager.mjs';
 import { sendTelegram } from './telegram-bot.mjs';
-import { logTrade, logExit } from './pnl-logger.mjs';
+import { logTrade, logExit, logStatusTransition } from './pnl-logger.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -100,6 +100,7 @@ async function placeOrder(tokenId, side, price, size, marketData) {
   const options = {
     tickSize: String(tickSize),
     negRisk: marketData?.negRisk || false,
+    orderType: OrderType.GTC,
   };
 
   const response = await retry(() =>
@@ -122,6 +123,54 @@ async function getOpenOrders() {
   const client = await initClobClient();
   if (client.rawMode) return [];
   return retry(() => client.getOrders({ status: 'LIVE' }));
+}
+
+// ── Check entry quality against live orderbook (Fix 9) ─────────────────────────
+async function checkEntryQuality(tokenId, whaleEntryPrice, marketData) {
+  const checks = [];
+
+  // 1. Get orderbook
+  const book = await retry(() =>
+    rateLimited(() => CLOB.getOrderBook(tokenId))
+  );
+
+  // 2. Spread check
+  const bestBid = book.bids?.[0] ? parseFloat(book.bids[0].price) : 0;
+  const bestAsk = book.asks?.[0] ? parseFloat(book.asks[0].price) : 1;
+  const spread = bestAsk - bestBid;
+  const spreadPct = spread / bestAsk;
+  if (spreadPct > 0.03) {
+    checks.push({ pass: false, reason: `Spread ${(spreadPct * 100).toFixed(1)}% > 3% max` });
+  } else {
+    checks.push({ pass: true });
+  }
+
+  // 3. Slippage check
+  if (bestAsk > whaleEntryPrice + CONFIG.execution.slippageBuffer) {
+    checks.push({ pass: false, reason: `Ask ${bestAsk.toFixed(3)} > whale entry ${whaleEntryPrice.toFixed(3)} + ${CONFIG.execution.slippageBuffer} slippage` });
+  } else {
+    checks.push({ pass: true });
+  }
+
+  // 4. Depth check — can we fill our size?
+  const ourSize = CONFIG.risk.maxPositionSizeUsd / bestAsk;
+  const askDepth = book.asks?.reduce((s, a) => s + parseFloat(a.size), 0) || 0;
+  if (askDepth < ourSize) {
+    checks.push({ pass: false, reason: `Ask depth ${askDepth.toFixed(0)} < our size ${ourSize.toFixed(0)}` });
+  } else {
+    checks.push({ pass: true });
+  }
+
+  // 5. Max entry price
+  if (bestAsk > 0.85) {
+    checks.push({ pass: false, reason: `Ask ${bestAsk.toFixed(3)} > 0.85 max entry price` });
+  } else {
+    checks.push({ pass: true });
+  }
+
+  const allPass = checks.every(c => c.pass);
+  const failedChecks = checks.filter(c => !c.pass).map(c => c.reason);
+  return { pass: allPass, bestAsk, bestBid, spread: spreadPct, failedChecks };
 }
 
 // ── Execute a signal: place a copy order ────────────────────────────────────────
@@ -147,7 +196,6 @@ export async function executeSignal(signal) {
 
   // Determine entry price (whale's entry + slippage buffer)
   const whaleEntryPrice = consensus?.avgEntryPrice || entry.price;
-  const ourPrice = Math.min(0.99, whaleEntryPrice + CONFIG.execution.slippageBuffer);
 
   // Get token ID
   const tokenId = market.asset; // The outcome token the whale bought
@@ -155,9 +203,6 @@ export async function executeSignal(signal) {
     console.warn('⚠️  No token ID in signal — cannot execute');
     return null;
   }
-
-  // Calculate size in tokens
-  const sizeInTokens = Math.ceil(positionSizeUsd / ourPrice);
 
   // Get market data for tick size / neg risk
   let marketData = signal.marketData;
@@ -170,11 +215,25 @@ export async function executeSignal(signal) {
     } : null;
   }
 
+  // Fix 9: Entry quality checks before placing the order
+  const quality = await checkEntryQuality(tokenId, whaleEntryPrice, marketData);
+  if (!quality.pass) {
+    await sendTelegram(`🚫 Trade skipped — entry quality checks failed:\n${quality.failedChecks.join('\n')}\n\nMarket: ${market.title}`);
+    console.log(`🚫 Entry quality checks failed for ${market.title}:\n${quality.failedChecks.join('\n')}`);
+    return null;
+  }
+
+  // Use the best ask as our entry price for instant fill
+  const ourPrice = quality.bestAsk;
+
+  // Calculate size in tokens
+  const sizeInTokens = Math.ceil(positionSizeUsd / ourPrice);
+
   try {
     // Place the order
     const order = await placeOrder(tokenId, 'BUY', ourPrice, sizeInTokens, marketData);
 
-    // Register the trade
+    // Register the trade with market metadata (Fix 6)
     const trade = {
       orderId: order.orderID,
       signalType: signal.type,
@@ -190,6 +249,11 @@ export async function executeSignal(signal) {
       consensusWhales: consensus?.whaleCount || 1,
       timestamp: Date.now(),
       status: 'PENDING_FILL',
+      // Market metadata for category tracking (Fix 6)
+      marketSlug: market.slug || '',
+      eventSlug: market.eventSlug || '',
+      category: market.eventSlug?.split('/')[0] || 'unknown',
+      assetId: market.asset || '',
     };
 
     registerTrade(trade);
@@ -231,6 +295,88 @@ export async function executeSignal(signal) {
   }
 }
 
+// ── Order Lifecycle Reconciliation (Fix 3) ─────────────────────────────────────
+let reconciliationTimer = null;
+
+export async function reconcileOrders() {
+  const positions = getOpenPositions();
+  const pendingOrders = positions.filter(p =>
+    p.status === 'PENDING_FILL' || p.status === 'SUBMITTED'
+  );
+
+  if (pendingOrders.length === 0) return;
+
+  let openOrders;
+  try {
+    openOrders = await getOpenOrders();
+  } catch (err) {
+    console.warn(`⚠️  Reconciliation: failed to fetch open orders: ${err.message}`);
+    return;
+  }
+
+  const openOrderIds = new Set(openOrders.map(o => o.orderID || o.id));
+
+  for (const pos of pendingOrders) {
+    const isInOpenOrders = openOrderIds.has(pos.orderId);
+    const previousStatus = pos.status;
+
+    if (isInOpenOrders) {
+      // Order is still live on the book
+      if (pos.status !== 'LIVE' && pos.status !== 'SUBMITTED') {
+        updatePositionStatus(pos.orderId, 'LIVE');
+        if (CONFIG.pnlLogger.enabled) {
+          logStatusTransition(pos.orderId, previousStatus, 'LIVE', pos.market);
+        }
+        console.log(`📋 Order ${pos.orderId} is LIVE on book (${pos.market})`);
+      }
+    } else {
+      // Order is NOT in open orders — either filled or cancelled
+      // Try to determine if it was cancelled
+      let wasCancelled = false;
+      try {
+        const client = await initClobClient();
+        if (!client.rawMode) {
+          const orderDetail = await retry(() => client.getOrder(pos.orderId));
+          if (orderDetail?.status === 'CANCELED' || orderDetail?.status === 'CANCELLED') {
+            wasCancelled = true;
+          }
+        }
+      } catch {
+        // If we can't get order details, assume filled (not in open orders, no cancel confirmation)
+      }
+
+      if (wasCancelled) {
+        updatePositionStatus(pos.orderId, 'CANCELLED');
+        if (CONFIG.pnlLogger.enabled) {
+          logStatusTransition(pos.orderId, previousStatus, 'CANCELLED', pos.market);
+        }
+        console.log(`❌ Order ${pos.orderId} CANCELLED (${pos.market})`);
+      } else {
+        // Order not in open orders and not cancelled → filled
+        updatePositionStatus(pos.orderId, 'FILLED');
+        if (CONFIG.pnlLogger.enabled) {
+          logStatusTransition(pos.orderId, previousStatus, 'FILLED', pos.market);
+        }
+        console.log(`✅ Order ${pos.orderId} FILLED (${pos.market})`);
+        await sendTelegram(`✅ *Order Filled*\n\nMarket: ${pos.market}\nOrder ID: ${pos.orderId}\nEntry: ${pos.entryPrice?.toFixed(3) || 'N/A'}`);
+      }
+    }
+  }
+}
+
+// Start the reconciliation loop
+export function startReconciliation() {
+  if (reconciliationTimer) return;
+  console.log('🔄 Starting order reconciliation loop (15s interval)');
+  reconciliationTimer = setInterval(async () => {
+    try {
+      await reconcileOrders();
+    } catch (err) {
+      console.warn(`⚠️  Reconciliation error: ${err.message}`);
+    }
+  }, 15000);
+}
+
 // ── Exit management: check open positions and apply exit logic ─────────────────
 export async function manageExits() {
   const positions = getOpenPositions();
@@ -240,6 +386,20 @@ export async function manageExits() {
   const now = Date.now();
 
   for (const pos of positions) {
+    // Fix 4: Check pending fill timeout FIRST, before status filter
+    if (pos.status === 'PENDING_FILL' || pos.status === 'SUBMITTED') {
+      const elapsed = (now - pos.timestamp) / 60000;
+      if (elapsed > CONFIG.execution.fillTimeoutMin) {
+        await cancelOrder(pos.orderId).catch(() => {});
+        updatePositionStatus(pos.orderId, 'CANCELLED');
+        console.log(`⏰ Cancelled unfilled order ${pos.orderId} (${elapsed.toFixed(1)}min)`);
+        await sendTelegram(`⏰ Order cancelled (unfilled for ${elapsed.toFixed(1)}min): ${pos.market}`);
+        continue;
+      }
+      // Still pending — skip exit checks but DO count in risk exposure
+      continue;
+    }
+
     if (pos.status !== 'FILLED' && pos.status !== 'OPEN') continue;
 
     try {
@@ -292,17 +452,6 @@ export async function manageExits() {
           exitReason = `Trailing stop at ${currentPrice.toFixed(3)} (peak: ${peakPrice.toFixed(3)})`;
           await exitPosition(pos, pos.size, currentPrice, exitReason);
           continue;
-        }
-      }
-
-      // Fill timeout
-      if (pos.status === 'PENDING_FILL') {
-        const elapsed = (now - pos.timestamp) / 60000;
-        if (elapsed > CONFIG.execution.fillTimeoutMin) {
-          // Cancel unfilled order
-          await cancelOrder(pos.orderId).catch(() => {});
-          pos.status = 'CANCELLED';
-          console.log(`⏰ Cancelled unfilled order ${pos.orderId} (${elapsed.toFixed(1)}min)`);
         }
       }
     } catch (err) {

@@ -61,6 +61,20 @@ function checkDailyReset() {
   }
 }
 
+// ── Compute portfolio equity (Fix 7) ───────────────────────────────────────────
+function computePortfolioEquity() {
+  const activePositions = openPositions.filter(p =>
+    p.status === 'FILLED' || p.status === 'OPEN'
+  );
+  const positionsValue = activePositions.reduce((s, p) => s + (p.currentValue || p.valueUsd || 0), 0);
+  const pendingExposure = openPositions.filter(p =>
+    p.status === 'PENDING_FILL' || p.status === 'SUBMITTED'
+  ).reduce((s, p) => s + (p.valueUsd || 0), 0);
+  const realizedPnl = dailyStats.pnl;
+  const totalEquity = positionsValue + pendingExposure + realizedPnl;
+  return { positionsValue, pendingExposure, realizedPnl, totalEquity };
+}
+
 // ── Check if a trade is allowed ────────────────────────────────────────────────
 export function checkRisk(signal) {
   loadState();
@@ -82,18 +96,22 @@ export function checkRisk(signal) {
     return { allowed: false, reason: `Daily trade limit reached (${dailyStats.trades}/${CONFIG.risk.maxDailyTrades})` };
   }
 
-  // Max concurrent positions
-  const activeCount = openPositions.filter(p => p.status === 'FILLED' || p.status === 'OPEN').length;
+  // Fix 5: Max concurrent positions — include pending orders in count
+  const activeCount = openPositions.filter(p =>
+    p.status === 'FILLED' || p.status === 'OPEN' ||
+    p.status === 'PENDING_FILL' || p.status === 'SUBMITTED'
+  ).length;
   if (activeCount >= CONFIG.risk.maxConcurrentPositions) {
     return { allowed: false, reason: `Max concurrent positions (${activeCount}/${CONFIG.risk.maxConcurrentPositions})` };
   }
 
-  // Per-category limit
+  // Fix 5/6: Per-category limit — use p.category instead of parsing marketSlug
   if (signal.market?.eventSlug) {
     const category = signal.market.eventSlug.split('/')[0] || 'unknown';
     const catCount = openPositions.filter(p =>
-      (p.status === 'FILLED' || p.status === 'OPEN') &&
-      (p.marketSlug?.split('/')[0] || 'unknown') === category
+      (p.status === 'FILLED' || p.status === 'OPEN' ||
+       p.status === 'PENDING_FILL' || p.status === 'SUBMITTED') &&
+      (p.category || (p.marketSlug?.split('/')[0]) || 'unknown') === category
     ).length;
     if (catCount >= CONFIG.risk.maxConcurrentPerCategory) {
       return { allowed: false, reason: `Max positions in category "${category}" (${catCount}/${CONFIG.risk.maxConcurrentPerCategory})` };
@@ -105,16 +123,28 @@ export function checkRisk(signal) {
     return { allowed: false, reason: `Daily loss limit hit ($${dailyStats.pnl.toFixed(2)} / -$${CONFIG.risk.dailyLossLimitUsd})` };
   }
 
-  // Portfolio drawdown
+  // Fix 7: Portfolio drawdown — use total equity, not just position value
+  const equity = computePortfolioEquity();
   if (portfolioPeak > 0) {
-    const currentValue = openPositions.reduce((s, p) => s + (p.currentValue || p.valueUsd || 0), 0);
-    const drawdown = (portfolioPeak - currentValue) / portfolioPeak;
+    const drawdown = (portfolioPeak - equity.totalEquity) / portfolioPeak;
     if (drawdown > CONFIG.risk.maxPortfolioDrawdownPct) {
       paused = true;
       pauseReason = `Portfolio drawdown ${(drawdown * 100).toFixed(1)}% > ${(CONFIG.risk.maxPortfolioDrawdownPct * 100)}% limit`;
       saveState();
       return { allowed: false, reason: pauseReason };
     }
+  }
+  // Update peak
+  if (equity.totalEquity > portfolioPeak) portfolioPeak = equity.totalEquity;
+
+  // Fix 8: Min balance enforcement
+  const availableCapital = CONFIG.risk.initialBankroll + equity.realizedPnl - equity.positionsValue - equity.pendingExposure;
+  if (availableCapital < CONFIG.risk.minBalanceUsd) {
+    return { allowed: false, reason: `Available capital $${availableCapital.toFixed(2)} < min balance $${CONFIG.risk.minBalanceUsd}` };
+  }
+  const tradeSize = signal.entry?.valueUsd || CONFIG.risk.maxPositionSizeUsd;
+  if (availableCapital < tradeSize) {
+    return { allowed: false, reason: `Insufficient capital for $${tradeSize} trade (available: $${availableCapital.toFixed(2)})` };
   }
 
   return { allowed: true };
@@ -126,7 +156,12 @@ export function registerTrade(trade) {
 
   openPositions.push({
     ...trade,
-    marketSlug: trade.signalType,
+    // Fix 6: Store actual market metadata, not signalType as marketSlug
+    marketSlug: trade.marketSlug || trade.market || '',
+    eventSlug: trade.eventSlug || '',
+    category: trade.category || '',
+    conditionId: trade.conditionId || '',
+    assetId: trade.tokenId || trade.assetId || '',
     entryPrice: trade.price,
     peakPrice: trade.price,
     currentValue: trade.valueUsd,
@@ -140,6 +175,19 @@ export function registerTrade(trade) {
   dailyStats.volume += trade.valueUsd;
 
   saveState();
+}
+
+// ── Update position status (Fix 3 — reconciliation support) ────────────────────
+export function updatePositionStatus(orderId, newStatus) {
+  loadState();
+
+  const pos = openPositions.find(p => p.orderId === orderId);
+  if (pos) {
+    const oldStatus = pos.status;
+    pos.status = newStatus;
+    saveState();
+    console.log(`📊 Status transition: ${orderId} ${oldStatus} → ${newStatus}`);
+  }
 }
 
 // ── Update position price (for trailing stop) ──────────────────────────────────
@@ -198,7 +246,11 @@ export function registerExit(orderId, exitDetails) {
 // ── Get open positions ─────────────────────────────────────────────────────────
 export function getOpenPositions() {
   loadState();
-  return openPositions.filter(p => p.status === 'FILLED' || p.status === 'OPEN' || p.status === 'PENDING_FILL');
+  return openPositions.filter(p =>
+    p.status === 'FILLED' || p.status === 'OPEN' ||
+    p.status === 'PENDING_FILL' || p.status === 'SUBMITTED' ||
+    p.status === 'LIVE'
+  );
 }
 
 // ── Get daily stats ────────────────────────────────────────────────────────────
@@ -211,6 +263,7 @@ export function getDailyStats() {
 // ── Get full portfolio status ──────────────────────────────────────────────────
 export function getPortfolioStatus() {
   loadState();
+  const equity = computePortfolioEquity();
   const active = openPositions.filter(p => p.status === 'FILLED' || p.status === 'OPEN');
   const totalValue = active.reduce((s, p) => s + (p.currentValue || p.valueUsd || 0), 0);
   const totalCost = active.reduce((s, p) => s + (p.valueUsd || 0), 0);
@@ -218,10 +271,12 @@ export function getPortfolioStatus() {
 
   return {
     activePositions: active.length,
+    pendingPositions: openPositions.filter(p => p.status === 'PENDING_FILL' || p.status === 'SUBMITTED').length,
     totalValue,
     totalCost,
     unrealizedPnl,
     realizedPnlToday: dailyStats.pnl,
+    totalEquity: equity.totalEquity,
     tradesToday: dailyStats.trades,
     winsToday: dailyStats.wins,
     lossesToday: dailyStats.losses,

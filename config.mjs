@@ -73,6 +73,7 @@ export const CONFIG = {
 
   // ── Layer 4: Risk Management ──────────────────────────────────────────────────
   risk: {
+    initialBankroll: 99.26,                // starting balance for tracking
     maxPositionSizeUsd: 5,              // max $5 per trade (5% of $99 bankroll)
     maxDailyTrades: 5,
     maxConcurrentPositions: 8,

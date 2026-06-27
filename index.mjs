@@ -5,10 +5,11 @@
 //                 PnL Logging, Multi-Source Discovery + Confluence
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
+import 'dotenv/config';
 import { CONFIG } from './config.mjs';
 import { discoverWhales } from './whale-discovery.mjs';
 import { startMonitoring } from './signal-monitor.mjs';
-import { manageExits } from './clob-executor.mjs';
+import { manageExits, startReconciliation } from './clob-executor.mjs';
 import { getPortfolioStatus, getDailyStats } from './risk-manager.mjs';
 import { sendTelegram, sendDailySummary } from './telegram-bot.mjs';
 import { startPusdTracking } from './moralis-pusd-tracker.mjs';
@@ -162,6 +163,9 @@ async function main() {
       console.warn(`⚠️  Exit management error: ${err.message}`);
     }
   }, 30000);
+
+  // Start order reconciliation loop (every 15s) — Fix 3
+  startReconciliation();
 
   // Daily summary cron (check every 5min if it's summary time)
   let lastSummaryDate = new Date().toISOString().slice(0, 10);

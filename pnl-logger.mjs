@@ -65,6 +65,21 @@ export function logTrade(trade) {
   return entry;
 }
 
+// ── Log a status transition (Fix 3 — reconciliation) ──────────────────────────
+export function logStatusTransition(tradeId, fromStatus, toStatus, market) {
+  const record = {
+    type: 'STATUS_TRANSITION',
+    tradeId,
+    market: market || '',
+    fromStatus,
+    toStatus,
+    timestamp: new Date().toISOString(),
+  };
+  appendJsonl(TRADE_LOG, record);
+  console.log(`📝 PnL Logger: ${tradeId} ${fromStatus} → ${toStatus}`);
+  return record;
+}
+
 // ── Log a trade exit (update existing trade) ──────────────────────────────────
 // Call this from clob-executor.mjs / risk-manager.mjs when a position is exited.
 // Since JSONL is append-only, we write an "exit" record that references the trade.

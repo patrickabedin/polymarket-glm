@@ -23,6 +23,7 @@ let wsReconnectTimer = null;
 let pollingFallbackActive = false;
 let pollingFallbackTimer = null;
 let trackedWhales = []; // reference for reconnects & fallback
+let heartbeatTimer = null; // WS PING heartbeat timer
 
 // ── WebSocket endpoint ─────────────────────────────────────────────────────────
 const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
@@ -307,6 +308,13 @@ function connectWebSocket(whales) {
     wsDisconnectTime = null;
     wsReconnectAttempts = 0;
 
+    // Start heartbeat — send PING every 10 seconds
+    heartbeatTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send('PING');
+      }
+    }, 10000);
+
     // If polling fallback was active, stop it
     if (pollingFallbackActive) {
       console.log('🔁 WebSocket restored — stopping polling fallback');
@@ -368,12 +376,15 @@ function connectWebSocket(whales) {
 
   ws.onerror = (err) => {
     console.error(`❌ WebSocket error: ${err.message || err}`);
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
   };
 
   ws.onclose = (event) => {
     console.log(`🔌 WebSocket disconnected (code: ${event.code}, reason: ${event.reason || 'N/A'})`);
     wsConnected = false;
     wsDisconnectTime = Date.now();
+
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
 
     // Schedule reconnection
     scheduleReconnect(whales);
