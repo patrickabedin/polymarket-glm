@@ -1,0 +1,24 @@
+{
+  "name": "polymarket-whale-copier",
+  "version": "1.0.0",
+  "description": "Polymarket whale copy-trading bot — discovers profitable wallets from the leaderboard, monitors their positions in real-time, and auto-executes copy trades via the CLOB API with full risk management.",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs",
+    "discover": "node whale-discovery.mjs",
+    "monitor": "node signal-monitor.mjs",
+    "test": "node --check index.mjs && node --check whale-discovery.mjs && node --check signal-monitor.mjs && node --check clob-executor.mjs && node --check risk-manager.mjs && echo 'All files syntax OK'"
+  },
+  "dependencies": {
+    "viem": "^2.0.0",
+    "@polymarket/clob-client-v2": "^1.0.0"
+  },
+  "optionalDependencies": {
+    "moralis": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
