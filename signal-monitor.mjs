@@ -510,7 +510,7 @@ async function pollAllWhales(whales) {
       console.warn(`⚠️  Poll error for ${whale.username}: ${err.message}`);
     }
     // Small delay between whales to avoid rate limits
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 200));
   }
   if (totalNew > 0) {
     console.log(`📊 Poll complete: ${totalNew} new signal(s) detected`);

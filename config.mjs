@@ -45,7 +45,7 @@ export const CONFIG = {
     filterCryptoCandleBots: true,        // detect & skip latency-edge bots
     filterCryptoCandleVolThreshold: 50,  // if 1m vol >50x avg → likely bot
     minMarketLiquidity: 5000,            // market must have ≥$5k liquidity
-    alwaysOnPollIntervalSec: 120,        // always-on polling interval (parallel with WS)
+    alwaysOnPollIntervalSec: 45,        // always-on polling interval (parallel with WS)
   },
 
   // ── Layer 3: Execution ────────────────────────────────────────────────────
