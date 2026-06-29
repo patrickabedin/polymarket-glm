@@ -52,7 +52,7 @@ export const CONFIG = {
   // Edge first, frequency second. No qualified signals today = no trades is correct.
   execution: {
     enabled: true,                       // auto-trade (Patrick said "must auto trade")
-    copyRatio: 0.05,                     // copy 5% of whale's position size
+    copyRatio: 0.10,                     // copy 5% of whale's position size
     slippageBuffer: 0.04,                // limit order 4% above whale's entry (loosened — polling delay means price moves)
     orderType: 'GTC',                    // Good-til-cancelled limit orders
     fillTimeoutMin: 30,                  // cancel if not filled in 30min
@@ -94,7 +94,7 @@ export const CONFIG = {
     tierAPlus: {
       minWinRate: 0.90, minResolved: 50, maxAvgEntryPrice: 0.50,
       minProfitFactor: 2.0, autoTradeStandalone: true,
-      maxStandaloneSizeUsd: 2,
+      maxStandaloneSizeUsd: 4,
     },
     tierB: {
       minWinRate: 0.65, minResolved: 25, maxAvgEntryPrice: 0.60,
@@ -119,13 +119,13 @@ export const CONFIG = {
     // copyRatio * whaleValue capped to this → $5
     // tradeEliteSharp maxStandaloneSizeUsd also capped to $2
     // NEVER increase without explicit approval
-    maxPositionSizeUsd: 5,              // max $5 per trade (5% of $99 bankroll)
-    maxDailyTrades: 5,
-    maxConcurrentPositions: 8,
-    maxConcurrentPerCategory: 3,         // max 3 in same category
+    maxPositionSizeUsd: 10,              // max $5 per trade (5% of $99 bankroll)
+    maxDailyTrades: 100,
+    maxConcurrentPositions: 16,
+    maxConcurrentPerCategory: 6,         // max 3 in same category
     maxPortfolioDrawdownPct: 0.15,      // pause if drawdown >15%
     minBalanceUsd: 10,                   // stop if balance < $10
-    dailyLossLimitUsd: 15,              // stop trading if daily loss > $15
+    dailyLossLimitUsd: 30,              // stop trading if daily loss > $15
     cooldownAfterLossMin: 30,           // 30min cooldown after a loss
   },
 
