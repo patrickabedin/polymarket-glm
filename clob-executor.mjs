@@ -1102,9 +1102,10 @@ export async function manageExits() {
       }
 
       // Take profit (scale out)
-      if (!pos.tp1Hit && currentPrice >= exitLogic.takeProfitRatios[0]) {
+      const tp1Target = pos.entryPrice * (1 + (exitLogic.takeProfitPcts?.[0] ?? 0.15));
+      if (!pos.tp1Hit && currentPrice >= tp1Target) {
         shouldExit = true;
-        exitReason = `TP1 at ${currentPrice.toFixed(3)}`;
+        exitReason = `TP1 +${((exitLogic.takeProfitPcts?.[0] ?? 0.15) * 100).toFixed(0)}% at ${currentPrice.toFixed(3)}`;
         // Scale out: sell half
         const exitSize = Math.floor(pos.size * exitLogic.scaleOutFraction);
         if (exitSize > 0) {
@@ -1126,9 +1127,10 @@ export async function manageExits() {
         }
       }
 
-      if (!pos.tp2Hit && currentPrice >= exitLogic.takeProfitRatios[1]) {
+      const tp2Target = pos.entryPrice * (1 + (exitLogic.takeProfitPcts?.[1] ?? 0.30));
+      if (!pos.tp2Hit && currentPrice >= tp2Target) {
         shouldExit = true;
-        exitReason = `TP2 at ${currentPrice.toFixed(3)}`;
+        exitReason = `TP2 +${((exitLogic.takeProfitPcts?.[1] ?? 0.30) * 100).toFixed(0)}% at ${currentPrice.toFixed(3)}`;
         // Fix 9: Account for pendingExitSize — only sell the remaining unfilled portion
         const remainingSize = pos.size - (pos.pendingExitSize || 0);
         if (remainingSize > 0) {
@@ -1145,9 +1147,10 @@ export async function manageExits() {
       }
 
       // Stop loss
-      if (currentPrice <= exitLogic.stopLossPrice) {
+      const stopLossTarget = pos.entryPrice * (1 - (exitLogic.stopLossPct ?? 0.20));
+      if (currentPrice <= stopLossTarget) {
         shouldExit = true;
-        exitReason = `Stop loss at ${currentPrice.toFixed(3)}`;
+        exitReason = `Stop loss -${((exitLogic.stopLossPct ?? 0.20) * 100).toFixed(0)}% at ${currentPrice.toFixed(3)}`;
         // Fix 9: Account for pendingExitSize
         const remainingSize = pos.size - (pos.pendingExitSize || 0);
         if (remainingSize > 0) {

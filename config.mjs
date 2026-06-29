@@ -69,11 +69,11 @@ export const CONFIG = {
 
     // Independent exit logic (don't blindly follow exits)
     exitLogic: {
-      takeProfitRatios: [0.85, 0.90],   // scale out at 0.85 and 0.90
+      takeProfitPcts: [0.15, 0.30],     // TP1 at +15% from entry, TP2 at +30%
       scaleOutFraction: 0.5,             // sell half at first TP
-      stopLossPrice: 0.30,              // hard stop if price drops to 0.20
+      stopLossPct: 0.20,                // hard stop at -20% from entry
       trailingStopEnabled: true,
-      trailingStopPct: 0.07,            // 10% trailing stop from peak
+      trailingStopPct: 0.05,            // 5% trailing stop from peak
       holdToResolution: false,           // if none of above hit, hold to resolution
       whaleExitEnabled: true,           // exit when whale sells
     },
