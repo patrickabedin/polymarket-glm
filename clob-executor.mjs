@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { CONFIG } from './config.mjs';
-import { CLOB, Gamma, retry, rateLimited } from './polymarket-api.mjs';
+import { CLOB, Gamma, Data, retry, rateLimited } from './polymarket-api.mjs';
 import { checkRisk, registerTrade, registerExit, setExitOrderMetadata, getOpenPositions, getAllStoredPositions, updatePositionPrice, updatePositionStatus, markTpHit, updatePositionFill, setPendingExitSize, incrementExitRetry, getExitRetries, isEventProcessed, markEventProcessed, makeEventHash } from './risk-manager.mjs';
 import { sendTelegram, sendTelegramHTML } from './telegram-bot.mjs';
 import { logTrade, logExit, logStatusTransition, logBlockedTrade, logSkippedTrade } from './pnl-logger.mjs';
@@ -1068,6 +1068,38 @@ export async function manageExits() {
 
       let shouldExit = false;
       let exitReason = '';
+
+      // ── Whale exit check: if the whale we copied sold, we sell too ──
+      if (exitLogic.whaleExitEnabled !== false && pos.whaleAddress) {
+        try {
+          const whalePositions = await retry(() =>
+            rateLimited(() =>
+              Data.getPositions(pos.whaleAddress, {
+                sizeThreshold: 0.01,
+                limit: 500,
+                redeemable: false,
+              })
+            )
+          );
+          // Check if whale still holds THIS market
+          const stillHolds = whalePositions.some(wp =>
+            wp.conditionId === pos.conditionId &&
+            wp.size > 0.01
+          );
+          if (!stillHolds) {
+            shouldExit = true;
+            exitReason = `Whale ${pos.whaleUsername || pos.whaleAddress?.slice(0,8)} exited — following`;
+            const remainingSize = pos.size - (pos.pendingExitSize || 0);
+            if (remainingSize > 0) {
+              console.log(`🐋 Whale exit detected for ${pos.market} — selling ${remainingSize} tokens`);
+              await exitPosition(pos, remainingSize, currentPrice, exitReason);
+            }
+            continue;
+          }
+        } catch (e) {
+          // Non-fatal — if we can't check whale position, continue with TP/SL
+        }
+      }
 
       // Take profit (scale out)
       if (!pos.tp1Hit && currentPrice >= exitLogic.takeProfitRatios[0]) {

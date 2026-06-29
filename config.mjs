@@ -71,10 +71,11 @@ export const CONFIG = {
     exitLogic: {
       takeProfitRatios: [0.85, 0.90],   // scale out at 0.85 and 0.90
       scaleOutFraction: 0.5,             // sell half at first TP
-      stopLossPrice: 0.20,              // hard stop if price drops to 0.20
+      stopLossPrice: 0.30,              // hard stop if price drops to 0.20
       trailingStopEnabled: true,
-      trailingStopPct: 0.10,            // 10% trailing stop from peak
-      holdToResolution: true,           // if none of above hit, hold to resolution
+      trailingStopPct: 0.07,            // 10% trailing stop from peak
+      holdToResolution: false,           // if none of above hit, hold to resolution
+      whaleExitEnabled: true,           // exit when whale sells
     },
 
     // Wallet (MUST be set via env)
