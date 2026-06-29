@@ -80,6 +80,35 @@ export function logStatusTransition(tradeId, fromStatus, toStatus, market) {
   return record;
 }
 
+// ── Fix 10: Log blocked/skipped trades to signal log ───────────────────────────
+export function logBlockedTrade(reason, market) {
+  const record = {
+    blocked: true,
+    blockReason: reason,
+    market: { title: market },
+    loggedAt: new Date().toISOString(),
+    timestamp: new Date().toISOString(),
+  };
+  const logFile = path.resolve(CONFIG.state.logFile);
+  appendJsonl(logFile, record);
+  console.log(`📝 PnL Logger: blocked trade — ${reason} (${market})`);
+  return record;
+}
+
+export function logSkippedTrade(reason, market) {
+  const record = {
+    skipped: true,
+    skipReason: reason,
+    market: { title: market },
+    loggedAt: new Date().toISOString(),
+    timestamp: new Date().toISOString(),
+  };
+  const logFile = path.resolve(CONFIG.state.logFile);
+  appendJsonl(logFile, record);
+  console.log(`📝 PnL Logger: skipped trade — ${reason} (${market})`);
+  return record;
+}
+
 // ── Log a trade exit (update existing trade) ──────────────────────────────────
 // Call this from clob-executor.mjs / risk-manager.mjs when a position is exited.
 // Since JSONL is append-only, we write an "exit" record that references the trade.

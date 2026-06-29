@@ -10,12 +10,12 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 export const Gamma = {
   async getMarkets(opts = {}) {
     const params = new URLSearchParams({
-      active: 'true',
-      closed: 'false',
       limit: String(opts.limit || 100),
       offset: String(opts.offset || 0),
       order: opts.order || 'volume',
       ascending: 'false',
+      ...(opts.active !== undefined ? { active: String(opts.active) } : { active: 'true' }),
+      ...(opts.closed !== undefined ? { closed: String(opts.closed) } : { closed: 'false' }),
       ...(opts.volume_num_min ? { volume_num_min: String(opts.volume_num_min) } : {}),
       ...(opts.liquidity_num_min ? { liquidity_num_min: String(opts.liquidity_num_min) } : {}),
     });
@@ -144,13 +144,6 @@ export const Data = {
 
 // ── CLOB API (public for prices, auth for trading) ────────────────────────────
 export const CLOB = {
-  async getPrice(tokenId) {
-    const url = `${CONFIG.api.clob}/price?token_id=${tokenId}`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`CLOB price ${r.status}`);
-    return r.json();
-  },
-
   async getPrices(tokenIds) {
     const url = `${CONFIG.api.clob}/prices`;
     const r = await fetch(url, {

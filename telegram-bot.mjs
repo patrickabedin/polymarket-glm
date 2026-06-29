@@ -32,6 +32,37 @@ export async function sendTelegram(text) {
   }
 }
 
+// Rich HTML-formatted Telegram alert (supports <b>, <i>, <a>, <code>, <pre>)
+export async function sendTelegramHTML(text) {
+  if (!CONFIG.telegram.botToken || !CONFIG.telegram.chatId) {
+    console.warn('⚠️  Telegram not configured — message not sent');
+    return;
+  }
+
+  try {
+    const url = `https://api.telegram.org/bot${CONFIG.telegram.botToken}/sendMessage`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CONFIG.telegram.chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: false,
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      console.warn(`⚠️  Telegram HTML send failed: ${r.status} ${err}`);
+      // Fallback to plain text
+      const plain = text.replace(/<[^>]+>/g, '');
+      await sendTelegram(plain);
+    }
+  } catch (err) {
+    console.warn(`⚠️  Telegram error: ${err.message}`);
+  }
+}
+
 // ── Send a photo/image ──────────────────────────────────────────────────────────
 export async function sendTelegramPhoto(photoUrl, caption) {
   if (!CONFIG.telegram.botToken || !CONFIG.telegram.chatId) return;

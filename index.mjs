@@ -9,7 +9,7 @@ import 'dotenv/config';
 import { CONFIG } from './config.mjs';
 import { discoverWhales } from './whale-discovery.mjs';
 import { startMonitoring } from './signal-monitor.mjs';
-import { manageExits, startReconciliation } from './clob-executor.mjs';
+import { manageExits, startReconciliation, startUserWebSocket } from './clob-executor.mjs';
 import { getPortfolioStatus, getDailyStats } from './risk-manager.mjs';
 import { sendTelegram, sendDailySummary } from './telegram-bot.mjs';
 import { startPusdTracking } from './moralis-pusd-tracker.mjs';
@@ -47,6 +47,17 @@ function banner() {
   Wallet Profiling: ${CONFIG.moralis.walletProfiling.enabled ? '✅ ON' : '❌ OFF'}
  ═══════════════════════════════════════════════════════════════════════
 `);
+
+// Fix 10: Report whether bot is LIVE or ALERT_ONLY based on env presence
+const _pkPresent = !!(process.env.POLY_PRIVATE_KEY && process.env.POLY_PRIVATE_KEY !== '0x' + '0'.repeat(64));
+const _funderPresent = !!(process.env.POLY_FUNDER_ADDRESS && process.env.POLY_FUNDER_ADDRESS !== '0x' + '0'.repeat(40));
+const _isLive = CONFIG.execution.enabled && _pkPresent && _funderPresent;
+console.log(`\n╔══ Deployment Safety Report ══╗`);
+console.log(`║  execution.enabled: ${CONFIG.execution.enabled}`);
+console.log(`║  private key present: ${_pkPresent ? 'yes' : 'no'}`);
+console.log(`║  funder present: ${_funderPresent ? 'yes' : 'no'}`);
+console.log(`║  mode: ${_isLive ? '🟢 LIVE' : '🟡 ALERT_ONLY'}`);
+console.log(`╚══════════════════════════════╝\n`);
 }
 
 async function main() {
@@ -92,11 +103,32 @@ async function main() {
     for (const ms of multiSourceWhales) {
       const alreadyTracked = whales.find(w => w.address.toLowerCase() === ms.address.toLowerCase());
       if (!alreadyTracked && ms.sourceCount >= 2) {
-        // This is a hidden whale found via multiple sources but not on the leaderboard
-        // We'd need to analyze them to get full stats, but for now add them with basic info
-        console.log(`  📌 Hidden whale from multi-source: ${ms.username} (sources: ${ms.sources.join(', ')})`);
-        // Hidden whales are noted but not fully tracked until they pass quality filters
-        // A full implementation would run analyzeWallet() on them here
+        // Fix 12: Analyze hidden multi-source whales before tracking
+        console.log(`  📌 Hidden whale from multi-source: ${ms.username} (sources: ${ms.sources.join(', ')}) — analyzing...`);
+        try {
+          const { analyzeWallet, classifyTraderTier } = await import('./whale-discovery.mjs');
+          const analysis = await analyzeWallet(ms.address);
+          if (analysis) {
+            const tier = classifyTraderTier(analysis);
+            if (tier && tier !== 'tierC') {
+              // Passes tier A+/A/B — include in tracked whales
+              whales.push({
+                ...analysis,
+                address: ms.address,
+                username: ms.username || `hidden_${ms.address.slice(0, 8)}`,
+                confluenceScore: ms.confluenceScore,
+                sources: ms.sources,
+                sourceCount: ms.sourceCount,
+                tier,
+              });
+              console.log(`  ✅ Hidden whale ${ms.username} admitted as Tier ${tier}`);
+            } else {
+              console.log(`  ⏭️  Hidden whale ${ms.username} classified Tier ${tier || 'C'} — not tracked`);
+            }
+          }
+        } catch (e) {
+          console.warn(`  ⚠️  Failed to analyze hidden whale ${ms.username}: ${e.message}`);
+        }
       }
     }
   } else {
@@ -166,6 +198,11 @@ async function main() {
 
   // Start order reconciliation loop (every 15s) — Fix 3
   startReconciliation();
+
+  // Fix 10: Start authenticated user WebSocket for real-time order updates
+  if (CONFIG.execution.enabled) {
+    startUserWebSocket();
+  }
 
   // Daily summary cron (check every 5min if it's summary time)
   let lastSummaryDate = new Date().toISOString().slice(0, 10);

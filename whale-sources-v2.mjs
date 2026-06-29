@@ -67,10 +67,10 @@ async function discoverFromLeaderboard() {
 async function discoverFromHolders() {
   console.log('  👥 Holders: scanning high-volume resolved markets...');
 
-  // Fetch recently resolved (closed) high-volume markets
+  // Fix 13: Fetch CLOSED markets for holders discovery (was fetching active=true/closed=false)
   const markets = await retry(() =>
     rateLimited(() =>
-      Gamma.getMarkets({ limit: 100, order: 'volume' })
+      Gamma.getMarkets({ limit: 100, order: 'volume', active: false, closed: true })
     )
   ).catch(() => []);
 

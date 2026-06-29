@@ -5,38 +5,56 @@
 
 import { CONFIG } from './config.mjs';
 import { Data, Gamma, CLOB, retry, rateLimited } from './polymarket-api.mjs';
-import { sendTelegram } from './telegram-bot.mjs';
+import { sendTelegram, sendTelegramHTML } from './telegram-bot.mjs';
+import { executeSignal } from './clob-executor.mjs';
 import fs from 'fs';
 import path from 'path';
 import { WebSocket } from 'ws';
 
-// ── State: track known positions per whale to detect NEW entries ────────────────
-let knownPositions = {}; // { [wallet]: Set(conditionId) }
-let consensusTracker = {}; // { [conditionId]: [{ wallet, side, time, size }] }
+// ── Fix 5: resolveTokenId helper — maps outcomeIndex to clobTokenIds from gamma market ──
+function resolveTokenId(position, gammaMarket) {
+  if (position.asset && position.asset.length > 10) {
+    return position.asset;
+  }
+  if (gammaMarket && gammaMarket.clobTokenIds) {
+    const tokenIds = typeof gammaMarket.clobTokenIds === 'string'
+      ? JSON.parse(gammaMarket.clobTokenIds)
+      : gammaMarket.clobTokenIds;
+    if (Array.isArray(tokenIds) && tokenIds.length > 0) {
+      const idx = position.outcomeIndex ?? 0;
+      if (idx >= 0 && idx < tokenIds.length) {
+        return tokenIds[idx];
+      }
+    }
+  }
+  return null;
+}
 
-// ── WebSocket state ────────────────────────────────────────────────────────────
+// ── State ────────────────────────────────────────────────────────────────────
+let knownPositions = {};
+let consensusTracker = {};
+let alwaysOnPollingTimer = null;
+
 let ws = null;
 let wsConnected = false;
-let wsDisconnectTime = null; // timestamp when WS went down; null if connected
+let wsDisconnectTime = null;
 let wsReconnectAttempts = 0;
 let wsReconnectTimer = null;
 let pollingFallbackActive = false;
 let pollingFallbackTimer = null;
-let trackedWhales = []; // reference for reconnects & fallback
-let heartbeatTimer = null; // WS PING heartbeat timer
+let trackedWhales = [];
+let heartbeatTimer = null;
 
-// ── WebSocket endpoint ─────────────────────────────────────────────────────────
 const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
-const WS_RECONNECT_BASE_MS = 1000; // 1s initial backoff
-const WS_RECONNECT_MAX_MS = 30000; // 30s max backoff
-const POLLING_FALLBACK_DELAY_MS = 60000; // start fallback polling after 60s of WS downtime
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 30000;
+const POLLING_FALLBACK_DELAY_MS = 60000;
 
 function loadState() {
   const stateFile = path.resolve(CONFIG.state.dir, 'monitor_state.json');
   if (fs.existsSync(stateFile)) {
     const data = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     knownPositions = data.knownPositions || {};
-    // Convert arrays back to Sets
     for (const k of Object.keys(knownPositions)) {
       knownPositions[k] = new Set(knownPositions[k]);
     }
@@ -57,7 +75,6 @@ function saveState() {
   fs.writeFileSync(stateFile, JSON.stringify(data, null, 2));
 }
 
-// ── Check if market is too close to resolution ─────────────────────────────────
 function isMarketNearResolution(position) {
   if (!CONFIG.monitoring.filterMarketsNearResolution) return false;
   if (!position.endDate) return false;
@@ -66,7 +83,6 @@ function isMarketNearResolution(position) {
   return hoursUntil < CONFIG.monitoring.filterResolutionBufferHours;
 }
 
-// ── Detect crypto candle bots (high-frequency, latency-edge) ───────────────────
 async function detectCryptoCandleBot(conditionId) {
   if (!CONFIG.monitoring.filterCryptoCandleBots) return false;
   try {
@@ -74,8 +90,6 @@ async function detectCryptoCandleBot(conditionId) {
       rateLimited(() => Data.getTrades({ market: conditionId, limit: 50 }))
     );
     if (trades.length < 10) return false;
-
-    // Check if trade frequency is abnormally high (many trades in 1 minute)
     const now = Date.now();
     const recentTrades = trades.filter(t => (now - t.timestamp * 1000) < 60000);
     return recentTrades.length > CONFIG.monitoring.filterCryptoCandleVolThreshold;
@@ -84,7 +98,6 @@ async function detectCryptoCandleBot(conditionId) {
   }
 }
 
-// ── Fetch current positions for a whale and detect new ones ────────────────────
 async function checkWhalePositions(whale, source = 'POLL') {
   const { address, username } = whale;
   if (!knownPositions[address]) knownPositions[address] = new Set();
@@ -109,11 +122,22 @@ async function checkWhalePositions(whale, source = 'POLL') {
 
   for (const pos of positions) {
     const conditionId = pos.conditionId;
-    const isNew = !knownPositions[address].has(conditionId);
+    let tokenId = null;
+    if (pos.asset && pos.asset.length > 10) {
+      tokenId = pos.asset;
+    } else {
+      const market = await retry(() => rateLimited(() => Gamma.getMarket(conditionId))).catch(() => null);
+      tokenId = resolveTokenId(pos, market);
+    }
+    if (!tokenId) {
+      console.warn(`⚠️  checkWhalePositions: cannot resolve tokenId for ${pos.title} — skipping`);
+      continue;
+    }
+    const posKey = `${conditionId}:${tokenId}`;
+    const isNew = !knownPositions[address].has(posKey);
 
     if (isNew) {
-      knownPositions[address].add(conditionId);
-
+      knownPositions[address].add(posKey);
       const signal = await processNewPosition(whale, pos, conditionId, source);
       if (signal) {
         newSignals.push(signal);
@@ -124,29 +148,23 @@ async function checkWhalePositions(whale, source = 'POLL') {
   return newSignals;
 }
 
-// ── Process a newly detected position (shared by WS and polling paths) ─────────
 async function processNewPosition(whale, pos, conditionId, source) {
   const { address, username } = whale;
 
-  // Filter: position size
   const positionSize = pos.size * pos.avgPrice;
   if (positionSize < CONFIG.monitoring.minPositionSizeUsd) return null;
 
-  // Filter: whale stake percentage
   const stakePct = pos.initialValue / (whale.stats?.portfolioValue || pos.initialValue);
   if (stakePct < CONFIG.monitoring.minWhaleStakePct) return null;
 
-  // Filter: near resolution
   if (isMarketNearResolution(pos)) return null;
 
-  // Filter: crypto candle bots
   const isBot = await detectCryptoCandleBot(conditionId);
   if (isBot) {
     console.log(`🤖 Skipping ${pos.title} — detected crypto candle bot pattern`);
     return null;
   }
 
-  // Filter: market liquidity
   const market = await retry(() =>
     rateLimited(() => Gamma.getMarket(conditionId))
   ).catch(() => null);
@@ -155,9 +173,16 @@ async function processNewPosition(whale, pos, conditionId, source) {
     return null;
   }
 
+  const resolvedTokenId = resolveTokenId(pos, market);
+  if (!resolvedTokenId) {
+    console.warn(`⚠️  Cannot resolve tokenId for ${pos.title} — skipping`);
+    await sendTelegram(`⚠️ *Cannot resolve tokenId*\n\nMarket: ${pos.title}\noutcomeIndex: ${pos.outcomeIndex}\nasset: ${pos.asset || 'missing'}\n\nTrade skipped — clobTokenIds not available.`);
+    return null;
+  }
+
   const signal = {
     type: 'WHALE_ENTRY',
-    source, // 'LIVE' or 'POLL'
+    source,
     whale: { address, username },
     market: {
       conditionId,
@@ -166,7 +191,7 @@ async function processNewPosition(whale, pos, conditionId, source) {
       eventSlug: pos.eventSlug,
       outcome: pos.outcome,
       outcomeIndex: pos.outcomeIndex,
-      asset: pos.asset,
+      asset: resolvedTokenId,
       oppositeAsset: pos.oppositeAsset,
     },
     entry: {
@@ -180,17 +205,25 @@ async function processNewPosition(whale, pos, conditionId, source) {
     marketData: market ? {
       liquidity: market.liquidityNum,
       volume: market.volumeNum,
-      tickSize: market.minimumTickSize,
+      tickSize: market.orderPriceMinTickSize || market.minimumTickSize || '0.01',
       negRisk: market.negRisk,
       clobTokenIds: market.clobTokenIds,
     } : null,
   };
 
-  // Add to consensus tracker
-  if (!consensusTracker[conditionId]) {
-    consensusTracker[conditionId] = [];
+  // Tier/consensus
+  const tier = whale.tier || 'tierB';
+  const weight = tier === 'tierAPlus' ? CONFIG.consensus.eliteSharpWeight
+    : tier === 'tierA' ? CONFIG.consensus.whaleWeight
+    : tier === 'tierB' ? CONFIG.consensus.sharpWeight
+    : 0.5;
+
+  const tokenId = resolvedTokenId;
+  const consensusKey = `${conditionId}:${tokenId}`;
+  if (!consensusTracker[consensusKey]) {
+    consensusTracker[consensusKey] = [];
   }
-  consensusTracker[conditionId].push({
+  consensusTracker[consensusKey].push({
     wallet: address,
     username,
     side: pos.outcome,
@@ -198,48 +231,68 @@ async function processNewPosition(whale, pos, conditionId, source) {
     time: Date.now(),
     size: positionSize,
     entryPrice: pos.avgPrice,
+    tier,
+    weight,
   });
 
-  // Check for consensus
-  const consensus = checkConsensus(conditionId);
+  const consensus = checkWeightedConsensus(consensusKey);
+  let shouldExecute = false;
+
   if (consensus) {
     signal.type = 'CONSENSUS';
     signal.consensus = consensus;
-    await sendTelegram(formatConsensusAlert(signal));
+    await sendTelegramHTML(formatConsensusAlert(signal));
+    shouldExecute = CONFIG.execution.tradeConsensus;
+  } else if (tier === 'tierAPlus' && CONFIG.traderTiers.tierAPlus.autoTradeStandalone) {
+    signal.type = 'ELITE_SHARP';
+    signal.eliteSharp = { tier: 'A+', trader: username };
+    await sendTelegramHTML(formatEliteSharpAlert(signal));
+    shouldExecute = CONFIG.execution.tradeEliteSharp;
   } else {
-    await sendTelegram(formatWhaleAlert(signal));
+    await sendTelegramHTML(formatWhaleAlert(signal));
+    shouldExecute = CONFIG.execution.tradeSingleWhale;
   }
 
+  // Execute trade if enabled
+  if (shouldExecute && CONFIG.execution.enabled) {
+    try {
+      console.log(`📤 Executing ${signal.type} signal for ${pos.title}...`);
+      await executeSignal(signal);
+    } catch (err) {
+      console.error(`❌ Execute signal failed: ${err.message}`);
+      await sendTelegram(`❌ *Trade execution failed*\n\nMarket: ${pos.title}\nError: ${err.message}`);
+    }
+  }
+
+  saveState();
   return signal;
 }
 
-// ── Check if a market has consensus (3+ whales same side within window) ────────
-function checkConsensus(conditionId) {
-  const entries = consensusTracker[conditionId] || [];
-  const windowMs = CONFIG.monitoring.consensusWindowMin * 60 * 1000;
+function checkWeightedConsensus(consensusKey) {
+  const entries = consensusTracker[consensusKey] || [];
+  const windowMs = CONFIG.consensus.windowMin * 60 * 1000;
   const now = Date.now();
-
-  // Filter to entries within the consensus window
   const recent = entries.filter(e => (now - e.time) < windowMs);
 
-  // Group by side (outcome)
   const bySide = {};
   for (const e of recent) {
-    const key = e.side;
+    const key = CONFIG.consensus.sameOutcomeOnly ? e.side : 'ANY';
     if (!bySide[key]) bySide[key] = [];
     bySide[key].push(e);
   }
 
-  // Check if any side has ≥ consensusMinWhales
-  for (const [side, wallets] of Object.entries(bySide)) {
-    const uniqueWallets = [...new Set(wallets.map(w => w.wallet))];
-    if (uniqueWallets.length >= CONFIG.monitoring.consensusMinWhales) {
+  for (const [side, traders] of Object.entries(bySide)) {
+    const uniqueWallets = [...new Set(traders.map(w => w.wallet))];
+    const weightedScore = traders.reduce((s, w) => s + (w.weight || 1), 0);
+
+    if (weightedScore >= CONFIG.consensus.minWeightedScore && uniqueWallets.length >= CONFIG.consensus.minUniqueTraders) {
       return {
         side,
         whaleCount: uniqueWallets.length,
-        whales: wallets,
-        totalSizeUsd: wallets.reduce((s, w) => s + w.size, 0),
-        avgEntryPrice: wallets.reduce((s, w) => s + w.entryPrice, 0) / wallets.length,
+        weightedScore: Math.round(weightedScore * 100) / 100,
+        whales: traders,
+        totalSizeUsd: traders.reduce((s, w) => s + w.size, 0),
+        avgEntryPrice: traders.reduce((s, w) => s + w.entryPrice, 0) / traders.length,
       };
     }
   }
@@ -248,392 +301,248 @@ function checkConsensus(conditionId) {
 }
 
 // ── Alert formatters ───────────────────────────────────────────────────────────
+
 function formatWhaleAlert(signal) {
-  const { whale, market, entry, source } = signal;
-  const tag = source === 'LIVE' ? '⚡ LIVE' : '⏱️ POLL';
+  const m = signal.market;
+  const e = signal.entry;
+  const w = signal.whale;
+  const url = `https://polymarket.com/event/${m.eventSlug || m.slug || ''}`;
   return [
-    `🐋 *WHALE ENTRY DETECTED* ${tag}`,
+    '🐋 <b>Whale Entry Detected</b>',
     '',
-    `*Trader:* ${whale.username}`,
-    `*Market:* ${market.title}`,
-    `*Side:* ${market.outcome}`,
-    `*Entry:* $${entry.price.toFixed(3)} (${entry.valueUsd.toFixed(0)} USD)`,
-    `*Stake:* ${(entry.stakePct * 100).toFixed(1)}% of portfolio`,
-    `*Current Price:* ${signal.currentPrice?.toFixed(3) || 'N/A'}`,
+    `📊 <b>Market:</b> ${m.title}`,
+    `🎯 <b>Outcome:</b> ${m.outcome}`,
+    `💰 <b>Entry Price:</b> $${e.price.toFixed(3)}`,
+    `💵 <b>Position Size:</b> $${e.valueUsd.toFixed(0)}`,
+    `🐋 <b>Trader:</b> ${w.username}`,
+    `📡 <b>Source:</b> ${signal.source}`,
     '',
-    `[View Market](https://polymarket.com/event/${market.eventSlug})`,
+    `🔗 <a href="${url}">View on Polymarket</a>`,
   ].join('\n');
 }
 
 function formatConsensusAlert(signal) {
-  const { market, consensus, source } = signal;
-  const tag = source === 'LIVE' ? '⚡ LIVE' : '⏱️ POLL';
-  const whaleList = consensus.whales
-    .map(w => `  • ${w.username} — $${w.size.toFixed(0)} @ ${w.entryPrice.toFixed(3)}`)
-    .join('\n');
+  const m = signal.market;
+  const c = signal.consensus;
+  const url = `https://polymarket.com/event/${m.eventSlug || m.slug || ''}`;
+  const whaleList = c.whales.slice(0, 5).map(w =>
+    `   • ${w.username} — $${w.size.toFixed(0)} @ $${w.entryPrice.toFixed(3)} (${w.tier})`
+  ).join('\n');
   return [
-    `🔥 *CONSENSUS SIGNAL — STRONG* ${tag}`,
+    '🎯 <b>CONSENSUS Signal — Multiple Whales Aligned</b>',
     '',
-    `*Market:* ${market.title}`,
-    `*Side:* ${consensus.side}`,
-    `*Whales:* ${consensus.whaleCount} agree`,
-    `*Total Stake:* $${consensus.totalSizeUsd.toFixed(0)}`,
-    `*Avg Entry:* ${consensus.avgEntryPrice.toFixed(3)}`,
+    `📊 <b>Market:</b> ${m.title}`,
+    `🎯 <b>Side:</b> ${c.side}`,
+    `🐋 <b>Whales:</b> ${c.whaleCount} (weighted score: ${c.weightedScore})`,
+    `💵 <b>Total Size:</b> $${c.totalSizeUsd.toFixed(0)}`,
+    `💰 <b>Avg Entry:</b> $${c.avgEntryPrice.toFixed(3)}`,
     '',
-    '*Whales entering:*',
+    '<b>Traders:</b>',
     whaleList,
     '',
-    `[View Market](https://polymarket.com/event/${market.eventSlug})`,
+    `🔗 <a href="${url}">View on Polymarket</a>`,
   ].join('\n');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  WEBSOCKET CONNECTION MANAGEMENT
-// ═══════════════════════════════════════════════════════════════════════════════
+function formatEliteSharpAlert(signal) {
+  const m = signal.market;
+  const e = signal.entry;
+  const w = signal.whale;
+  const url = `https://polymarket.com/event/${m.eventSlug || m.slug || ''}`;
+  return [
+    '⭐ <b>ELITE SHARP (A+) Entry</b>',
+    '',
+    `📊 <b>Market:</b> ${m.title}`,
+    `🎯 <b>Outcome:</b> ${m.outcome}`,
+    `💰 <b>Entry Price:</b> $${e.price.toFixed(3)}`,
+    `💵 <b>Position Size:</b> $${e.valueUsd.toFixed(0)}`,
+    `🐋 <b>Elite Trader:</b> ${w.username}`,
+    `📡 <b>Source:</b> ${signal.source}`,
+    '',
+    `🔗 <a href="${url}">View on Polymarket</a>`,
+  ].join('\n');
+}
+
+// ── WebSocket connection ──────────────────────────────────────────────────────
 
 function connectWebSocket(whales) {
-  console.log(`🔌 Connecting to Polymarket WebSocket: ${WS_URL}`);
+  trackedWhales = whales;
 
-  try {
-    ws = new WebSocket(WS_URL);
-  } catch (err) {
-    console.error(`❌ WebSocket construction failed: ${err.message}`);
-    scheduleReconnect(whales);
-    return;
-  }
+  console.log(`🔌 Connecting to Polymarket WebSocket (${WS_URL})...`);
 
-  ws.onopen = async () => {
-    console.log('✅ WebSocket connected — subscribing to whale wallets');
+  ws = new WebSocket(WS_URL);
+
+  ws.on('open', () => {
     wsConnected = true;
     wsDisconnectTime = null;
     wsReconnectAttempts = 0;
+    console.log('✅ WebSocket connected');
 
-    // Start heartbeat — send PING every 10 seconds
+    // Subscribe to all tracked whale activity
+    // The Polymarket WS subscribes to market channels; we subscribe to
+    // tokens that our tracked whales have positions in
+    const subscribeMsg = {
+      type: 'market',
+      assets_ids: getSubscribedTokens(whales),
+    };
+    ws.send(JSON.stringify(subscribeMsg));
+    console.log(`📡 Subscribed to ${subscribeMsg.assets_ids.length} token IDs`);
+
+    // Heartbeat
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send('PING');
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.ping();
       }
-    }, 10000);
+    }, 30000);
+  });
 
-    // If polling fallback was active, stop it
-    if (pollingFallbackActive) {
-      console.log('🔁 WebSocket restored — stopping polling fallback');
-      stopPollingFallback();
-    }
-
-    // Subscribe to market channel for all active markets
-    // We'll get real-time trade events and cross-reference with whale addresses
-    // First, fetch all active market token IDs
-    console.log('  📡 Fetching active market token IDs...');
-    let allTokenIds = [];
+  ws.on('message', async (data) => {
     try {
-      const marketsResp = await fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=500&order=volume&ascending=false');
-      const markets = await marketsResp.json();
-      for (const m of markets) {
-        if (m.clobTokenIds) {
-          const tokenIds = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
-          if (Array.isArray(tokenIds)) {
-            allTokenIds.push(...tokenIds);
-          }
+      const msg = JSON.parse(data.toString());
+      // WebSocket messages are price-change events, not position changes.
+      // The actual whale position detection is done via polling.
+      // WS is used for real-time price awareness on subscribed tokens.
+      if (msg.type === 'book' || msg.type === 'price_change' || msg.type === 'tick_size_change') {
+        // Price update — could be used for real-time PnL tracking
+        // For now, just log occasionally
+        if (Math.random() < 0.01) {
+          console.log(`📊 WS price update on token ${msg.asset_id?.slice(0, 8)}...`);
         }
       }
-      console.log(`  📡 ${allTokenIds.length} token IDs from ${markets.length} markets`);
     } catch (err) {
-      console.warn(`  ⚠️  Failed to fetch market token IDs: ${err.message}`);
+      // Non-JSON or parse error — ignore
     }
+  });
 
-    // Subscribe in batches (WS may have message size limits)
-    const BATCH_SIZE = 100;
-    for (let i = 0; i < allTokenIds.length; i += BATCH_SIZE) {
-      const batch = allTokenIds.slice(i, i + BATCH_SIZE);
-      const subMsg = JSON.stringify({
-        assets_ids: batch,
-        type: 'market',
-      });
-      try {
-        ws.send(subMsg);
-      } catch (err) {
-        console.error(`  ❌ Failed to subscribe batch ${i}: ${err.message}`);
-      }
-    }
-    console.log(`  📡 Subscribed to ${allTokenIds.length} token IDs in ${Math.ceil(allTokenIds.length / BATCH_SIZE)} batches`);
-  };
-
-  ws.onmessage = async (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-
-      // Polymarket WS may send arrays or single objects
-      const messages = Array.isArray(msg) ? msg : [msg];
-
-      for (const m of messages) {
-        await handleWebSocketMessage(m, whales);
-      }
-    } catch (err) {
-      // Non-JSON or keepalive messages are fine to ignore
-    }
-  };
-
-  ws.onerror = (err) => {
-    console.error(`❌ WebSocket error: ${err.message || err}`);
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-  };
-
-  ws.onclose = (event) => {
-    console.log(`🔌 WebSocket disconnected (code: ${event.code}, reason: ${event.reason || 'N/A'})`);
+  ws.on('close', () => {
     wsConnected = false;
     wsDisconnectTime = Date.now();
-
     if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    console.warn('⚠️  WebSocket disconnected — starting polling fallback');
 
-    // Schedule reconnection
-    scheduleReconnect(whales);
-
-    // Start polling fallback after delay if still disconnected
-    schedulePollingFallback(whales);
-  };
-}
-
-// ── Handle incoming WebSocket messages ─────────────────────────────────────────
-async function handleWebSocketMessage(msg, whales) {
-  // Process last_trade_price events (trade executions on the market channel)
-  if (msg.event_type !== 'last_trade_price' && msg.event_type !== 'trade') return;
-
-  // Market channel format: { event_type: 'last_trade_price', market, asset_id, price, side, size, timestamp, ... }
-  // User channel format: { event_type: 'trade', trade: { ... } }
-  const trade = msg.trade || msg;
-  const conditionId = trade.market || trade.condition_id;
-  const assetId = trade.asset_id || trade.assetId;
-  const side = trade.side;
-  const tradeSize = parseFloat(trade.size || 0);
-  const tradePrice = parseFloat(trade.price || 0);
-
-  if (!conditionId || !assetId) return;
-
-  // Market channel doesn't include maker/taker addresses.
-  // We need to check recent trades via Data API to see if a tracked whale was involved.
-  // Use a quick lookup: fetch recent trades for this market and check for whale addresses.
-  try {
-    const recentTrades = await retry(() =>
-      rateLimited(() => Data.getTrades({ market: conditionId, limit: 10 }))
-    );
-
-    // Check if any recent trade involves a tracked whale (as taker)
-    for (const t of recentTrades) {
-      const takerAddr = (t.takerAddress || t.taker_address || '').toLowerCase();
-      const whale = whales.find(w => w.address.toLowerCase() === takerAddr);
-      if (!whale) continue;
-
-      // Only BUYs (new positions)
-      if ((t.side || side) !== 'BUY') continue;
-
-      // Check if this is a new market for this whale
-      if (!knownPositions[whale.address]) knownPositions[whale.address] = new Set();
-      const isNew = !knownPositions[whale.address].has(conditionId);
-      if (!isNew) continue;
-
-      // Mark as known immediately
-      knownPositions[whale.address].add(conditionId);
-
-      console.log(`⚡ LIVE trade detected: ${whale.username} BUY on ${conditionId.slice(0, 16)}...`);
-
-      // Fetch full position details
-      const positions = await retry(() =>
-        rateLimited(() =>
-          Data.getPositions(whale.address, {
-            sizeThreshold: CONFIG.monitoring.minPositionSizeUsd,
-            limit: 500,
-            redeemable: false,
-          })
-        )
-      );
-
-      const pos = positions.find(p => p.conditionId === conditionId);
-      if (!pos) {
-        knownPositions[whale.address].delete(conditionId);
-        continue;
-      }
-
-      const signal = await processNewPosition(whale, pos, conditionId, 'LIVE');
-      if (signal) {
-        await emitSignal(signal);
-      }
-
-      return; // processed this market, no need to check more trades
+    // Start polling fallback after delay
+    if (!pollingFallbackTimer) {
+      pollingFallbackTimer = setTimeout(() => {
+        if (!wsConnected) {
+          pollingFallbackActive = true;
+          startPollingFallback(whales);
+        }
+      }, POLLING_FALLBACK_DELAY_MS);
     }
-  } catch (err) {
-    // Non-critical — the polling fallback will catch it
-  }
-}
 
-// ── Emit a signal to execution layer and log ───────────────────────────────────
-async function emitSignal(signal) {
-  console.log(`📡 Signal: ${signal.type} — ${signal.whale.username} → ${signal.market.title} [${signal.source}]`);
-
-  // Write to log
-  const logLine = JSON.stringify({
-    ...signal,
-    loggedAt: new Date().toISOString(),
+    // Reconnect with backoff
+    scheduleReconnect(whales);
   });
-  fs.appendFileSync(
-    path.resolve(CONFIG.state.logFile),
-    logLine + '\n'
-  );
 
-  // Emit to execution layer (imported dynamically to avoid circular deps)
-  const { executeSignal } = await import('./clob-executor.mjs');
-  if (CONFIG.execution.enabled && (signal.type === 'CONSENSUS' || signal.type === 'WHALE_ENTRY')) {
-    await executeSignal(signal).catch(err =>
-      console.error(`❌ Execution error: ${err.message}`)
-    );
-  }
+  ws.on('error', (err) => {
+    console.warn(`⚠️  WebSocket error: ${err.message}`);
+  });
 }
 
-// ── Reconnection with exponential backoff ──────────────────────────────────────
 function scheduleReconnect(whales) {
-  if (wsReconnectTimer) return; // already scheduled
-
+  if (wsReconnectTimer) return;
   wsReconnectAttempts++;
   const delay = Math.min(
     WS_RECONNECT_BASE_MS * Math.pow(2, wsReconnectAttempts - 1),
     WS_RECONNECT_MAX_MS
   );
-
-  console.log(`🔄 Reconnecting WebSocket in ${(delay / 1000).toFixed(1)}s (attempt ${wsReconnectAttempts})...`);
-
+  console.log(`🔄 Reconnecting WebSocket in ${Math.round(delay / 1000)}s (attempt ${wsReconnectAttempts})...`);
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null;
     connectWebSocket(whales);
   }, delay);
 }
 
-// ── Polling fallback: starts if WS has been down for >60s ──────────────────────
-function schedulePollingFallback(whales) {
-  if (pollingFallbackActive) return; // already running
-
-  const checkDelay = POLLING_FALLBACK_DELAY_MS;
-
-  setTimeout(() => {
-    // Only start polling if WS is still down after the delay
-    if (!wsConnected && !pollingFallbackActive) {
-      console.log('⏱️  WebSocket down >60s — starting polling fallback');
-      startPollingFallback(whales);
+function getSubscribedTokens(whales) {
+  // Collect all known token IDs from whale positions
+  const tokens = new Set();
+  for (const whale of whales) {
+    // If whale has cached positions with token IDs, include them
+    if (whale.knownTokens) {
+      for (const t of whale.knownTokens) tokens.add(t);
     }
-  }, checkDelay);
+  }
+  // If we have tracked positions in knownPositions, include those tokens
+  for (const wallet of Object.keys(knownPositions)) {
+    for (const posKey of knownPositions[wallet]) {
+      const tokenId = posKey.split(':')[1];
+      if (tokenId) tokens.add(tokenId);
+    }
+  }
+  return [...tokens];
+}
+
+// ── Polling (always-on, parallel with WS) ────────────────────────────────────
+
+function startAlwaysOnPolling(whales) {
+  const intervalMs = CONFIG.monitoring.alwaysOnPollIntervalSec * 1000;
+  console.log(`🔄 Starting always-on polling every ${CONFIG.monitoring.alwaysOnPollIntervalSec}s (${whales.length} whales)`);
+
+  // Initial poll immediately
+  pollAllWhales(whales);
+
+  if (alwaysOnPollingTimer) clearInterval(alwaysOnPollingTimer);
+  alwaysOnPollingTimer = setInterval(() => {
+    pollAllWhales(whales);
+  }, intervalMs);
 }
 
 function startPollingFallback(whales) {
-  pollingFallbackActive = true;
+  console.log(`🔄 Starting polling fallback (every ${CONFIG.monitoring.pollIntervalSec}s)`);
+  const intervalMs = CONFIG.monitoring.pollIntervalSec * 1000;
 
-  const pollOnce = async () => {
-    if (!pollingFallbackActive) return;
+  pollAllWhales(whales);
 
-    if (wsConnected) {
-      stopPollingFallback();
-      return;
-    }
-
-    console.log('⏱️  Running polling fallback cycle...');
-    for (const whale of whales) {
-      try {
-        const signals = await checkWhalePositions(whale, 'POLL');
-        for (const signal of signals) {
-          await emitSignal(signal);
-        }
-      } catch (err) {
-        console.warn(`⚠️  Fallback poll error for ${whale.username}: ${err.message}`);
-      }
-    }
-    saveState();
-  };
-
-  // Run immediately
-  pollOnce();
-
-  // Then on interval
-  pollingFallbackTimer = setInterval(pollOnce, CONFIG.monitoring.pollIntervalSec * 1000);
+  if (pollingFallbackTimer) clearInterval(pollingFallbackTimer);
+  pollingFallbackTimer = setInterval(() => {
+    pollAllWhales(whales);
+  }, intervalMs);
 }
 
-function stopPollingFallback() {
-  pollingFallbackActive = false;
-  if (pollingFallbackTimer) {
-    clearInterval(pollingFallbackTimer);
-    pollingFallbackTimer = null;
-  }
-}
-
-// ── Main monitoring entry point ────────────────────────────────────────────────
-export async function startMonitoring(whales) {
-  console.log(' ═══════════════════════════════════════════════════════');
-  console.log(` 📡 SIGNAL MONITOR — Tracking ${whales.length} whales`);
-  console.log(` 🔌 Mode: WebSocket (real-time) with polling fallback`);
-  console.log(` ⏱️  Fallback poll interval: ${CONFIG.monitoring.pollIntervalSec}s`);
-  console.log(' ═══════════════════════════════════════════════════════');
-
-  loadState();
-  trackedWhales = whales;
-
-  // Initial snapshot of all positions (so we don't alert on existing positions)
-  console.log('📸 Taking initial position snapshot...');
+async function pollAllWhales(whales) {
+  let totalNew = 0;
   for (const whale of whales) {
     try {
-      const positions = await retry(() =>
-        rateLimited(() =>
-          Data.getPositions(whale.address, {
-            sizeThreshold: CONFIG.monitoring.minPositionSizeUsd,
-            limit: 500,
-            redeemable: false,
-          })
-        )
-      );
-      if (!knownPositions[whale.address]) knownPositions[whale.address] = new Set();
-      for (const p of positions) {
-        knownPositions[whale.address].add(p.conditionId);
-      }
-      console.log(`  ${whale.username}: ${positions.length} known positions`);
+      const signals = await checkWhalePositions(whale, 'POLL');
+      totalNew += signals.length;
     } catch (err) {
-      console.warn(`  ⚠️  ${whale.username}: ${err.message}`);
+      console.warn(`⚠️  Poll error for ${whale.username}: ${err.message}`);
     }
+    // Small delay between whales to avoid rate limits
+    await new Promise(r => setTimeout(r, 500));
   }
-  saveState();
-  console.log('✅ Initial snapshot complete. Now monitoring for new entries.\n');
-
-  // Start WebSocket connection
-  connectWebSocket(whales);
-
-  // Graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down signal monitor...');
-    if (ws) {
-      try { ws.close(); } catch {}
-    }
-    stopPollingFallback();
-    if (wsReconnectTimer) {
-      clearTimeout(wsReconnectTimer);
-    }
+  if (totalNew > 0) {
+    console.log(`📊 Poll complete: ${totalNew} new signal(s) detected`);
     saveState();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', () => {
-    if (ws) {
-      try { ws.close(); } catch {}
-    }
-    stopPollingFallback();
-    if (wsReconnectTimer) {
-      clearTimeout(wsReconnectTimer);
-    }
-    saveState();
-    process.exit(0);
-  });
+  }
 }
 
-// Clean old consensus entries periodically
-setInterval(() => {
-  const windowMs = CONFIG.monitoring.consensusWindowMin * 60 * 1000 * 4; // keep 4x window
-  const now = Date.now();
-  for (const cid of Object.keys(consensusTracker)) {
-    consensusTracker[cid] = consensusTracker[cid].filter(e => (now - e.time) < windowMs);
-    if (consensusTracker[cid].length === 0) delete consensusTracker[cid];
-  }
-}, 60000); // every minute
+// ── Main entry point ──────────────────────────────────────────────────────────
+
+export async function startMonitoring(whales) {
+  console.log(`\n📡 Signal Monitor starting with ${whales.length} whales`);
+
+  // Load persisted state
+  loadState();
+  console.log(`📁 Loaded state: ${Object.keys(knownPositions).length} tracked wallets`);
+
+  // Start always-on polling (runs in parallel with WS for redundancy)
+  startAlwaysOnPolling(whales);
+
+  // Connect WebSocket
+  connectWebSocket(whales);
+
+  // Initial state snapshot
+  console.log(`📊 Initial state: ${whales.length} whales, ${getSubscribedTokens(whales).length} tracked tokens`);
+  console.log(`🔄 Polling every ${CONFIG.monitoring.alwaysOnPollIntervalSec}s (always-on)`);
+  console.log(`⚡ WS: ${wsConnected ? 'connected' : 'connecting...'}\n`);
+
+  // Save state periodically
+  setInterval(() => {
+    saveState();
+  }, 60000); // every 1min
+
+  // Keep the process alive (this function blocks forever)
+  return new Promise(() => {});
+}

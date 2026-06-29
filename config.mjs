@@ -15,7 +15,7 @@ export const CONFIG = {
     minWinRate: 0.75,                     // ≥75% win rate
     minResolvedPositions: 10,             // ≥10 resolved positions
     maxAvgEntryPrice: 0.60,              // ≤0.60 avg entry (filters late scalpers)
-    minTotalStake: 5000,                 // ≥$5,000 total stake
+    minTotalStake: 1000,                 // ≥$1,000 total stake (lowered from 5000 for tiered discovery)
 
     // Scoring weights
     scoreWeights: {
@@ -45,15 +45,27 @@ export const CONFIG = {
     filterCryptoCandleBots: true,        // detect & skip latency-edge bots
     filterCryptoCandleVolThreshold: 50,  // if 1m vol >50x avg → likely bot
     minMarketLiquidity: 5000,            // market must have ≥$5k liquidity
+    alwaysOnPollIntervalSec: 120,        // always-on polling interval (parallel with WS)
   },
 
   // ── Layer 3: Execution ────────────────────────────────────────────────────
+  // Edge first, frequency second. No qualified signals today = no trades is correct.
   execution: {
     enabled: true,                       // auto-trade (Patrick said "must auto trade")
     copyRatio: 0.05,                     // copy 5% of whale's position size
-    slippageBuffer: 0.02,                // limit order 2% above whale's entry
+    slippageBuffer: 0.04,                // limit order 4% above whale's entry (loosened — polling delay means price moves)
     orderType: 'GTC',                    // Good-til-cancelled limit orders
     fillTimeoutMin: 30,                  // cancel if not filled in 30min
+
+    // Signal-type trading toggles
+    tradeSingleWhale: true,             // trade on individual whale entries
+    tradeConsensus: true,                // trade on consensus signals
+    tradeEliteSharp: true,               // trade on elite sharp (A+ standalone) signals
+
+    // Exit order timeout and reprice
+    exitOrderTimeoutMin: 10,             // cancel exit if not filled in 10min
+    exitRepriceEnabled: true,            // reprice exit at current best bid on timeout
+    exitMaxRetries: 3,                   // max reprice attempts before returning to FILLED
 
     // Independent exit logic (don't blindly follow exits)
     exitLogic: {
@@ -71,9 +83,41 @@ export const CONFIG = {
     signatureType: 3,                    // 3 = POLY_1271 (EIP-1271 smart contract wallet)
   },
 
+  // ── Trader Tiers ─────────────────────────────────────────────────────────────
+  traderTiers: {
+    tierA: {
+      minWinRate: 0.80, minResolved: 30, maxAvgEntryPrice: 0.55,
+      minProfitFactor: 1.5, minRecentActivityDays: 7,
+      autoTradeStandalone: false,
+    },
+    tierAPlus: {
+      minWinRate: 0.90, minResolved: 50, maxAvgEntryPrice: 0.50,
+      minProfitFactor: 2.0, autoTradeStandalone: true,
+      maxStandaloneSizeUsd: 2,
+    },
+    tierB: {
+      minWinRate: 0.65, minResolved: 25, maxAvgEntryPrice: 0.60,
+      minProfitFactor: 1.2,
+    },
+    tierC: {
+      minWinRate: 0.55, minResolved: 10,
+    },
+  },
+
+  // ── Consensus (weighted scoring) ──────────────────────────────────────────────
+  consensus: {
+    minWeightedScore: 3.0, whaleWeight: 1.5, sharpWeight: 1.0,
+    eliteSharpWeight: 2.0, minUniqueTraders: 2, windowMin: 30,
+    sameOutcomeOnly: true,
+  },
+
   // ── Layer 4: Risk Management ──────────────────────────────────────────────────
   risk: {
     initialBankroll: 99.26,                // starting balance for tracking
+    // ── $5 max checklist ──
+    // copyRatio * whaleValue capped to this → $5
+    // tradeEliteSharp maxStandaloneSizeUsd also capped to $2
+    // NEVER increase without explicit approval
     maxPositionSizeUsd: 5,              // max $5 per trade (5% of $99 bankroll)
     maxDailyTrades: 5,
     maxConcurrentPositions: 8,
@@ -111,14 +155,14 @@ export const CONFIG = {
     chain: 'polygon',
     // pUSD flow tracking
     pusdTracking: {
-      enabled: true,
+      enabled: false,  // disabled — requires Moralis (not needed for core trading)
       pollIntervalSec: 60,
       minDepositAlertUsd: 100,
     },
     // Wallet profiling
     walletProfiling: {
-      enabled: true,
-      refreshIntervalHours: 24, // re-profile daily
+      enabled: false,  // disabled — requires Moralis (not needed for core trading)
+      refreshIntervalHours: 24,
     },
   },
 
@@ -159,7 +203,14 @@ export const CONFIG = {
 };
 
 // Validate critical config
-if (CONFIG.execution.enabled && !CONFIG.execution.privateKey) {
-  console.warn('⚠️  POLY_PRIVATE_KEY not set — execution disabled (alert-only mode)');
-  CONFIG.execution.enabled = false;
+const DUMMY_KEY = /^0x0{64}$/i;
+const DUMMY_FUNDER = /^0x0{40}$/i;
+if (CONFIG.execution.enabled) {
+  if (!CONFIG.execution.privateKey || DUMMY_KEY.test(CONFIG.execution.privateKey)) {
+    console.warn('⚠️  POLY_PRIVATE_KEY is missing or a dummy zero key — execution disabled (alert-only mode)');
+    CONFIG.execution.enabled = false;
+  } else if (!CONFIG.execution.funderAddress || DUMMY_FUNDER.test(CONFIG.execution.funderAddress)) {
+    console.warn('⚠️  POLY_FUNDER_ADDRESS is missing or a dummy zero address — execution disabled (alert-only mode)');
+    CONFIG.execution.enabled = false;
+  }
 }

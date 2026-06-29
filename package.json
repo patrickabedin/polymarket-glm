@@ -1,6 +1,6 @@
 {
   "name": "polymarket-whale-copier",
-  "version": "1.0.0",
+  "version": "1.3.2",
   "description": "Polymarket whale copy-trading bot — discovers profitable wallets from the leaderboard, monitors their positions in real-time, and auto-executes copy trades via the CLOB API with full risk management.",
   "type": "module",
   "main": "index.mjs",
@@ -9,18 +9,16 @@
     "discover": "node whale-discovery.mjs",
     "monitor": "node signal-monitor.mjs",
     "report": "node report.mjs",
-    "test": "node --check index.mjs && node --check whale-discovery.mjs && node --check signal-monitor.mjs && node --check clob-executor.mjs && node --check risk-manager.mjs && node --check moralis-pusd-tracker.mjs && node --check moralis-wallet-profiler.mjs && node --check whale-scoring-v2.mjs && node --check pnl-logger.mjs && node --check whale-sources-v2.mjs && echo 'All files syntax OK'"
+    "test": "node --check index.mjs && node --check whale-discovery.mjs && node --check signal-monitor.mjs && node --check clob-executor.mjs && node --check risk-manager.mjs && node --check moralis-pusd-tracker.mjs && node --check moralis-wallet-profiler.mjs && node --check whale-scoring-v2.mjs && node --check pnl-logger.mjs && node --check whale-sources-v2.mjs && node --check report.mjs && echo 'All files syntax OK'"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "^1.0.0",
     "dotenv": "^16.6.1",
-    "viem": "^2.0.0"
-  },
-  "optionalDependencies": {
-    "moralis": "^2.0.0"
+    "viem": "^2.0.0",
+    "ws": "^8.16.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.10.0"
   },
   "license": "MIT"
 }

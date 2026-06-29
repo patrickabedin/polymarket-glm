@@ -4,38 +4,7 @@
 
 All trades on Polymarket are on-chain (Polygon) — fully transparent. This bot discovers profitable wallets, monitors their positions in real-time, and auto-executes copy trades via the CLOB API with full risk management.
 
-## Architecture — 5 Layers
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Layer 1: WHALE DISCOVERY                                           │
-│  Scan leaderboard → filter by WR/entry/stake → score → rank top 20  │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 2: SIGNAL MONITOR                                            │
-│  Poll whale positions every 30s → detect new entries → consensus    │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 3: AUTO EXECUTION                                            │
-│  CLOB API limit orders → 10% of whale size → independent exits      │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 4: RISK MANAGEMENT                                           │
-│  Max $50/trade, 10 trades/day, 15% drawdown kill, category limits   │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 5: TELEGRAM ALERTS                                           │
-│  Whale entries, consensus signals, trade fills, exits, daily summary │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-## Why Polymarket (not TradingView/Cornix)
-
-| Feature | Polymarket | TradingView/Cornix |
-|---------|-----------|-------------------|
-| Trade transparency | ✅ All on-chain (Polygon) | ❌ Private |
-| Order placement API | ✅ Full CLOB API | ❌ Cornix middleman |
-| Position tracking | ✅ Public Data API | ❌ No visibility |
-| Whale wallet tracking | ✅ Leaderboard + positions | ❌ Impossible |
-| SDK | ✅ Python/TS/Rust official | ❌ None |
-
-## Quick Start
+## Quick Start (5 minutes)
 
 ```bash
 # 1. Clone
@@ -45,118 +14,201 @@ cd polymarket-glm
 # 2. Install dependencies
 npm install
 
-# 3. Configure
+# 3. Configure environment
 cp .env.example .env
-# Edit .env with your wallet key + Telegram bot token
+# Edit .env — fill in POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-# 4. Run whale discovery (one-time, see who we'll track)
-node whale-discovery.mjs
+# 4. Syntax check
+npm test
 
-# 5. Start the full bot
-npm start
+# 5. Start with PM2
+pm2 start index.mjs --name polymarket-copier
+pm2 save
+
+# 6. Verify it's running
+pm2 logs polymarket-copier --lines 50
 ```
+
+You should see the startup banner, whale discovery (151 wallets analyzed, ~50 tracked), WebSocket connection, and "Signal Monitor starting".
+
+## What You Need
+
+| Item | How to Get It |
+|------|---------------|
+| **Polymarket wallet** | Create a wallet on polymarket.com (browser wallet → Polymarket UI creates an EIP-1167 minimal proxy). Export the private key from your wallet settings. |
+| **Wallet address** | Your Polymarket proxy wallet address (starts with `0x...`). This is the `POLY_FUNDER_ADDRESS`. |
+| **Private key** | The EOA signer private key (`0x...` 64 hex chars). This is the `POLY_PRIVATE_KEY`. |
+| **signatureType** | Already set to `3` (POLY_1271) in config.mjs. This is correct for Polymarket-upgraded wallets. **Do not change it.** |
+| **Telegram bot** | Message @BotFather → /newbot → get token. Message @userinfobot to get your chat ID. |
+
+### Wallet Setup Notes
+
+- Polymarket upgrades your wallet to an EIP-1167 minimal proxy. The `POLY_FUNDER_ADDRESS` is the **proxy** address (not your EOA).
+- The `POLY_PRIVATE_KEY` is the **EOA signer** key, not the proxy.
+- To find both: go to polymarket.com → Settings → look for your wallet address (proxy). The signer EOA is the address that signed the original wallet creation.
+- **Test with $5-10 first.** The bot's default config caps trades at $5 each, $15 daily loss, $10 min balance.
+
+## Architecture — 5 Layers
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  index.mjs (orchestrator)            │
+├─────────┬─────────┬─────────┬─────────┬──────────────┤
+│ Layer 1 │ Layer 2 │ Layer 3 │ Layer 4 │   Layer 5    │
+│ Discover│ Monitor │ Execute │  Risk   │   Telegram   │
+│         │         │         │         │              │
+│ whale-  │ signal- │ clob-   │ risk-   │ telegram-    │
+│ discov. │ monitor │ exec.   │ manager │ bot          │
+│ + v2    │ .mjs    │ .mjs    │ .mjs    │ .mjs         │
+│ sources │         │         │         │              │
+└─────────┴─────────┴─────────┴─────────┴──────────────┘
+```
+
+### Layer 1: Whale Discovery (`whale-discovery.mjs` + `whale-sources-v2.mjs` + `whale-scoring-v2.mjs`)
+- Fetches Polymarket leaderboards (OVERALL, POLITICS, CRYPTO, SPORTS)
+- Filters: ≥75% win rate, ≥10 resolved positions, ≤0.60 avg entry price, ≥$1,000 total stake
+- Classifies into tiers: A+ (elite sharp, auto-trade standalone), A, B, C
+- Multi-source discovery adds wallets found via holders, on-chain, and social signals
+- Scores on: timing accuracy, sizing consistency, category specialization, win rate, PnL magnitude
+- Re-ranks every 60 minutes
+- Output: `data/whales.json` (top 50 tracked wallets)
+
+### Layer 2: Signal Monitoring (`signal-monitor.mjs`)
+- **WebSocket** connection to `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+- Subscribes to all token IDs from tracked whales' known positions
+- **Always-on polling** (every 120s) runs in parallel with WS for redundancy
+- Detects NEW whale positions (not existing ones — state is persisted in `data/monitor_state.json`)
+- Three signal types:
+  - **WHALE_ENTRY** — single whale enters a market (alert + optional trade)
+  - **CONSENSUS** — 2+ whales enter same market within 30min window (weighted score ≥3.0)
+  - **ELITE_SHARP** — A+ tier whale acts alone (auto-trade standalone enabled)
+- Filters: min position $500, min whale stake 1%, filter markets near resolution (<24h), filter crypto candle bots, min liquidity $5k
+
+### Layer 3: CLOB Execution (`clob-executor.mjs`)
+- Uses `@polymarket/clob-client-v2` SDK for authenticated order placement
+- Limit orders (GTC) at best ask price for instant fills
+- Position sizing: `copyRatio (5%) × whaleValue`, capped at `$5` max
+- A+ standalone trades capped at `$2`
+- Entry quality checks: spread ≤6%, slippage ≤4% above whale entry, depth sufficient, max entry price ≤0.92
+- Exit management: scale-out at 0.85/0.90, hard stop at 0.20, 10% trailing stop, hold-to-resolution
+- Order reconciliation loop (every 15s) checks fill status
+- User WebSocket for real-time order updates
+
+### Layer 4: Risk Management (`risk-manager.mjs`)
+- Max $5 per trade (5% of $99 bankroll)
+- Max 5 daily trades
+- Max 8 concurrent positions
+- Max 3 per category
+- 15% max portfolio drawdown → pause
+- $10 min balance → stop
+- $15 daily loss limit → stop
+- 30min cooldown after losses
+- State: `data/risk_state.json`
+
+### Layer 5: Telegram Alerts (`telegram-bot.mjs`)
+- Whale entry alerts (HTML formatted)
+- Consensus alerts (multi-whale)
+- Elite sharp alerts (A+ standalone)
+- Trade execution alerts
+- Risk gate blocks
+- Daily summary at 8:00 UTC
+
+## File Reference
+
+| File | Purpose |
+|------|---------|
+| `index.mjs` | Main entry point — orchestrates all layers |
+| `config.mjs` | All configuration (discovery, monitoring, execution, risk, Telegram) |
+| `whale-discovery.mjs` | Leaderboard fetching, wallet analysis, tier classification |
+| `whale-sources-v2.mjs` | Multi-source discovery (holders, onchain, social) |
+| `whale-scoring-v2.mjs` | 10-dimension wallet scoring |
+| `signal-monitor.mjs` | WebSocket + polling monitor, signal detection, alert formatting |
+| `clob-executor.mjs` | CLOB order placement, exit management, reconciliation |
+| `risk-manager.mjs` | Position sizing, circuit breakers, portfolio tracking |
+| `telegram-bot.mjs` | Telegram message sending (Markdown + HTML) |
+| `polymarket-api.mjs` | Gamma + Data + CLOB API client wrappers |
+| `pnl-logger.mjs` | Trade-level + daily JSONL PnL logging |
+| `moralis-pusd-tracker.mjs` | Optional pUSD flow tracking (requires Moralis) |
+| `moralis-wallet-profiler.mjs` | Optional wallet classification (requires Moralis) |
+| `.env.example` | Template for environment variables |
+
+## Data Files
+
+| File | Content |
+|------|---------|
+| `data/whales.json` | Tracked whale wallets (top 50) |
+| `data/whales_multisource.json` | Multi-source discovery results |
+| `data/monitor_state.json` | Known positions per whale (for new-position detection) |
+| `data/risk_state.json` | Open positions, trade history, daily stats |
+| `data/pnl_log.jsonl` | Trade-level PnL log |
+| `data/pnl_daily.jsonl` | Daily PnL summaries |
+| `data/polymarket_copier.jsonl` | Engine event log |
 
 ## Configuration
 
-All settings are in `config.mjs`. Key parameters:
+All config is in `config.mjs`. Key sections:
 
-### Whale Discovery Filters
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `minWinRate` | 0.75 | Minimum win rate (75%) |
-| `minResolvedPositions` | 10 | Minimum resolved positions |
-| `maxAvgEntryPrice` | 0.60 | Max avg entry (filters late scalpers) |
-| `minTotalStake` | 5000 | Minimum total stake ($5K) |
-| `maxTrackedWallets` | 20 | Track top 20 wallets |
-
-### Signal Monitoring
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `pollIntervalSec` | 30 | Poll whale positions every 30s |
-| `consensusMinWhales` | 3 | 3+ whales = strong signal |
-| `consensusWindowMin` | 10 | Within 10-minute window |
-| `minPositionSizeUsd` | 500 | Ignore trades < $500 |
-| `filterCryptoCandleBots` | true | Skip latency-edge bots |
+### Risk (change these to match your bankroll)
+```javascript
+risk: {
+  initialBankroll: 99.26,
+  maxPositionSizeUsd: 5,        // max $5 per trade
+  maxDailyTrades: 5,
+  maxConcurrentPositions: 8,
+  maxConcurrentPerCategory: 3,
+  maxPortfolioDrawdownPct: 0.15,
+  minBalanceUsd: 10,
+  dailyLossLimitUsd: 15,
+  cooldownAfterLossMin: 30,
+}
+```
 
 ### Execution
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `copyRatio` | 0.10 | Copy 10% of whale's position |
-| `slippageBuffer` | 0.02 | Limit 2% above whale entry |
-| `orderType` | GTC | Good-til-cancelled |
-| `takeProfitRatios` | [0.85, 0.90] | Scale out at 0.85 and 0.90 |
-| `stopLossPrice` | 0.20 | Hard stop at $0.20 |
-| `trailingStopPct` | 0.10 | 10% trailing stop |
-
-### Risk Management
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `maxPositionSizeUsd` | 50 | Max $50 per trade |
-| `maxDailyTrades` | 10 | Max 10 trades/day |
-| `maxConcurrentPositions` | 10 | Max 10 open at once |
-| `maxConcurrentPerCategory` | 3 | Max 3 in same category |
-| `maxPortfolioDrawdownPct` | 0.15 | Pause at 15% drawdown |
-| `dailyLossLimitUsd` | 50 | Stop if daily loss > $50 |
-| `cooldownAfterLossMin` | 30 | 30min cooldown after loss |
-
-## API Reference
-
-### Polymarket APIs Used
-
-| API | Base URL | Auth | Purpose |
-|-----|----------|------|---------|
-| Gamma | `gamma-api.polymarket.com` | None | Markets, events, search |
-| Data | `data-api.polymarket.com` | None | Positions, trades, leaderboard |
-| CLOB | `clob.polymarket.com` | Wallet | Order placement, orderbook, prices |
-
-### Key Endpoints
-
-```
-GET /v1/leaderboard?category=OVERALL&timePeriod=ALL&orderBy=PNL&limit=50
-GET /positions?user={address}&sizeThreshold=1&limit=500
-GET /closed-positions?user={address}&limit=500
-GET /trades?user={address}&limit=100
-GET /markets?active=true&closed=false&limit=100
-GET /price?token_id={tokenId}
-GET /book?token_id={tokenId}
+```javascript
+execution: {
+  enabled: true,                // auto-trade (false = alert-only)
+  copyRatio: 0.05,              // copy 5% of whale's position size
+  slippageBuffer: 0.04,         // 4% above whale entry
+  orderType: 'GTC',
+  fillTimeoutMin: 30,
+  signatureType: 3,             // POLY_1271 — do NOT change
+}
 ```
 
-## File Structure
-
-```
-polymarket-whale-copier/
-├── index.mjs              # Main entry — orchestrates all 5 layers
-├── config.mjs             # All configuration
-├── polymarket-api.mjs     # Gamma + Data + CLOB API client
-├── whale-discovery.mjs    # Layer 1: Leaderboard scan + wallet scoring
-├── signal-monitor.mjs     # Layer 2: Position polling + consensus detection
-├── clob-executor.mjs      # Layer 3: Order placement + exit management
-├── risk-manager.mjs       # Layer 4: Circuit breakers + position limits
-├── telegram-bot.mjs       # Layer 5: Telegram alerts + daily summary
-├── package.json
-├── .env.example
-└── .gitignore
+### Monitoring
+```javascript
+monitoring: {
+  pollIntervalSec: 30,          // polling fallback interval
+  alwaysOnPollIntervalSec: 120, // always-on polling (parallel with WS)
+  consensusMinWhales: 3,
+  minPositionSizeUsd: 500,
+  minMarketLiquidity: 5000,
+  filterResolutionBufferHours: 24,
+}
 ```
 
-## Backtest Evidence
-
-A backtest of copy-trading Polymarket whales with these filters (≥10 resolved positions, ≥$5K stake, ≥75% WR, avg entry ≤0.60) showed **46.7% ROI over 90 days**.
-
-## Requirements
-
-- Node.js 18+
-- Polygon wallet with pUSD (for auto-trade mode)
-- Telegram bot token (for alerts)
-- PM2 (recommended for production)
-
-## PM2 Deployment
+## PM2 Commands
 
 ```bash
-npm install
+# Start
 pm2 start index.mjs --name polymarket-copier
+
+# Save process list (survives reboots)
 pm2 save
+
+# Logs
+pm2 logs polymarket-copier --lines 100
+
+# Restart
+pm2 restart polymarket-copier --update-env
+
+# Stop
+pm2 stop polymarket-copier
+
+# Delete
+pm2 delete polymarket-copier
 ```
 
-## License
+## Troubleshooting
 
-MIT
+See [DEPLOYMENT.md](DEPLOYMENT.md) for comprehensive troubleshooting, pitfalls, and lessons learned.

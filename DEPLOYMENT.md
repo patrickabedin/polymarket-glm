@@ -1,423 +1,285 @@
-# Polymarket Whale Copier — Complete Documentation
+# DEPLOYMENT.md — Polymarket Whale Copy Trader
 
-## Table of Contents
-1. [What This Is](#what-this-is)
-2. [Architecture Overview](#architecture-overview)
-3. [How We Built It (Step by Step)](#how-we-built-it)
-4. [Pitfalls & Lessons Learned](#pitfalls--lessons-learned)
-5. [Deployment Guide (From Scratch)](#deployment-guide-from-scratch)
-6. [Configuration Reference](#configuration-reference)
-7. [API Reference](#api-reference)
-8. [Troubleshooting](#troubleshooting)
+Complete deployment guide with troubleshooting, pitfalls, and lessons learned.
 
----
+## Prerequisites
 
-## What This Is
+- Node.js ≥ 20.10.0
+- PM2 process manager
+- A Polymarket wallet with funds (USDC on Polygon)
+- A Telegram bot token
 
-An automated copy-trading bot for Polymarket prediction markets. It discovers profitable wallets from the Polymarket leaderboard, monitors their positions in real-time via WebSocket, and auto-executes copy trades via the CLOB API with full risk management.
+## Full Deployment (fresh server)
 
-**Why Polymarket (not TradingView/Cornix):**
-- All trades are on-chain (Polygon) — fully transparent
-- Public API with order placement (CLOB)
-- Public leaderboard with PnL rankings
-- No middleman needed — we trade directly
-
-**Backtest evidence:** Copy-trading wallets with ≥75% WR, ≥10 resolved positions, avg entry ≤0.60 showed 46.7% ROI over 90 days.
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Layer 1: WHALE DISCOVERY                                           │
-│  Scan leaderboard → filter by WR/entry/stake → score → rank top 20  │
-│  API: Polymarket Data API (no auth)                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 2: SIGNAL MONITOR (WebSocket + polling fallback)             │
-│  Connect to wss://ws-subscriptions-clob.polymarket.com/ws/market    │
-│  Subscribe to 200+ token IDs across 100 active markets              │
-│  On trade event → cross-reference with whale wallets via Data API   │
-│  If whale new entry → emit signal (⚡ LIVE or ⏱️ POLL)             │
-│  Consensus: 3+ whales same market within 10min = strong signal     │
-│  Fallback: 30s polling if WS down >60s                             │
-│  Reconnection: exponential backoff (1s → 30s max)                  │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 3: AUTO EXECUTION                                            │
-│  CLOB API order placement via @polymarket/clob-client-v2            │
-│  signatureType: POLY_1271 (3) — EIP-1271 smart contract wallet      │
-│  Limit orders at ask price for instant fills                       │
-│  Copy ratio: 5% of whale position (capped at $5)                   │
-│  Independent exits: TP at 0.85/0.90, stop at 0.20, trailing 10%    │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 4: RISK MANAGEMENT                                           │
-│  Max $5/trade, 5 trades/day, 8 concurrent positions                │
-│  Max 3 per category, 15% drawdown kill, $15 daily loss limit       │
-│  30min cooldown after loss                                         │
-├─────────────────────────────────────────────────────────────────────┤
-│  Layer 5: TELEGRAM ALERTS                                           │
-│  Whale entries, consensus signals, trade fills, exits, daily summary│
-│  Bot: @skynet_cyberdin_bot                                         │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## How We Built It
-
-### Step 1: Research (Polymarket APIs)
-Discovered Polymarket has 3 public APIs:
-- **Gamma API** (no auth) — markets, events, prices, volume
-- **Data API** (no auth) — positions, trades, leaderboard, whale tracking
-- **CLOB API** (wallet auth) — order placement, orderbook, prices
-
-### Step 2: Built 5-Layer Engine
-Wrote 8 files implementing all layers:
-- `config.mjs` — all parameters
-- `polymarket-api.mjs` — API client (Gamma + Data + CLOB)
-- `whale-discovery.mjs` — Layer 1
-- `signal-monitor.mjs` — Layer 2
-- `clob-executor.mjs` — Layer 3
-- `risk-manager.mjs` — Layer 4
-- `telegram-bot.mjs` — Layer 5
-- `index.mjs` — orchestrator
-
-### Step 3: Created GitHub Repo
-- Repo: `patrickabedin/polymarket-glm`
-- Deleted old compromised repos (`polymarket-oracle`, `skynet-crew-copytrader`) that had exposed wallet credentials
-
-### Step 4: Deployed to DO Droplet
-- SCP'd files to `/app/polymarket-copier/`
-- `npm install` (viem, @polymarket/clob-client-v2, @polymarket/clob-client, ws, ethers)
-- PM2: `polymarket-copier` (id 68)
-- Also deployed `accumulation_scanner.mjs` to `/app/trading_engine/scripts/`
-
-### Step 5: WebSocket Upgrade
-- Replaced 30s polling with real-time WebSocket
-- Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- Subscribes to 200 token IDs across 100 active markets
-- Polling fallback after 60s WS downtime
-- Used `ws` npm package (Node v20 on droplet doesn't have global WebSocket)
-
-### Step 6: Fixed Wallet Issues (Major Pitfall)
-- Patrick's wallet was upgraded by Polymarket UI
-- Old wallet: `0x08535205Cf1BafD37E4C4B9906E1305e154BC183` (Gnosis Safe)
-- New wallet: `0x707f068abe713CA75642954dfB698Ca0303A2E55` (EIP-1167 proxy)
-- Required signatureType change: POLY_GNOSIS_SAFE (2) → POLY_1271 (3)
-- Test trade: 5 shares "Phillies win NL East" YES @ 0.36 = $1.80 → INSTANT FILL ✅
-
----
-
-## Pitfalls & Lessons Learned
-
-### 1. CRITICAL: Wallet Credential Exposure
-**What happened:** Old repo `polymarket-oracle` had wallet addresses, proxy credentials, and references to compromised keys committed to GitHub in `src/index.ts`.
-
-**Lesson:** NEVER commit wallet addresses, private keys, proxy credentials, or any identifying info to ANY repo (even private). Use `.env` files (gitignored) exclusively.
-
-**What we did:** Deleted both old repos. New repo has zero hardcoded credentials. All secrets in `.env` (600 perms, gitignored).
-
-### 2. CRITICAL: Polymarket Wallet Upgrade Changes signatureType
-**What happened:** Polymarket UI asked Patrick to "upgrade your wallet". This silently changed the wallet from a Gnosis Safe (signatureType=2) to an EIP-1167 minimal proxy with EIP-1271 support (signatureType=3).
-
-**Symptom:** `{"error":"maker address not allowed, please use the deposit wallet flow"}` with signatureType=0, 1, and 2.
-
-**Fix:** Use `signatureType=3` (POLY_1271) with the `@polymarket/clob-client-v2` SDK. The v1 client (`@polymarket/clob-client`) doesn't support POLY_1271 properly.
-
-**How to determine wallet type:**
-```javascript
-const code = await provider.getCode(funderAddress);
-if (code === '0x') → EOA (signatureType=0)
-else if (has getOwners()) → Gnosis Safe (signatureType=2)
-else if (has owner()) → Polymarket Proxy (signatureType=1 or 3)
-  → Try POLY_1271 (3) first for upgraded wallets
-```
-
-### 3. WebSocket URL Path Matters
-**What happened:** Connected to `wss://ws-subscriptions-clob.polymarket.com/ws` → 404.
-
-**Correct endpoints:**
-- Market channel (no auth): `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- User channel (auth): `wss://ws-subscriptions-clob.polymarket.com/ws/user`
-
-### 4. Node v20 Doesn't Have Global WebSocket
-**What happened:** `WebSocket is not defined` error on droplet (Node v20).
-
-**Fix:** Install `ws` npm package and import: `import { WebSocket } from 'ws';`
-
-### 5. Gamma API Field Names Differ from Docs
-**What happened:** Code looked for `minimumTickSize` but the actual field is `orderPriceMinTickSize`.
-
-**Other field name gotchas:**
-- `clobTokenIds` — returned as a JSON string, not an array (must `JSON.parse()`)
-- `volumeNum` / `liquidityNum` — not `volume_num` / `liquidity_num`
-- `negRisk` — boolean, not string
-
-### 6. CLOB Balance Endpoint Unreliable for Proxy Wallets
-**What happened:** `getBalanceAllowance` returns `{"balance":"0"}` even when the wallet has funds and can trade.
-
-**Workaround:** Don't rely on the balance endpoint for proxy wallets. Test with actual order placement instead. Monitor fill confirmations via order status (`"matched"` = filled).
-
-### 7. Market Channel Doesn't Include Maker/Taker Addresses
-**What happened:** The market WebSocket channel emits `last_trade_price` events but without wallet addresses. Can't directly identify which whale made the trade.
-
-**Workaround:** On each trade event, do a quick Data API lookup (`GET /trades?market={conditionId}&limit=10`) and cross-reference taker addresses with tracked whale wallets.
-
-### 8. Polymarket Markets Have Huge Spreads
-**What happened:** Most long-shot markets have bid=0.001, ask=0.999. Can't get filled at a reasonable price.
-
-**Solution:** Filter for markets with `spread < 0.05` and `bestAsk` between 0.10 and 0.90. These are typically high-volume markets (politics, sports).
-
-### 9. FAK vs FOK Order Types
-- **FAK (Fill-And-Kill / IOC):** Fills what it can, cancels rest. Good for our use case.
-- **FOK (Fill-Or-Kill):** All-or-nothing. Might fail on low-liquidity markets.
-- We use GTC (Good-Til-Cancelled) limit orders at ask price for instant fills.
-
-### 10. Old vs New Polymarket SDK
-- `@polymarket/clob-client` (v4) — uses ethers v5, supports signatureType 0/1/2
-- `@polymarket/clob-client-v2` (v1.0.6) — uses viem, supports signatureType 0/1/2/3
-- **Use v2** for POLY_1271 support
-
----
-
-## Deployment Guide (From Scratch)
-
-### Prerequisites
-- DO droplet (or any Linux server) with Node.js 18+
-- Polymarket account with upgraded wallet
-- Telegram bot token (from @BotFather)
-- PM2 installed globally
-
-### Step 1: Clone Repo
 ```bash
+# 1. Clone
 git clone https://github.com/patrickabedin/polymarket-glm.git
 cd polymarket-glm
-```
 
-### Step 2: Install Dependencies
-```bash
+# 2. Install dependencies
 npm install
-```
 
-### Step 3: Configure Environment
-```bash
+# 3. Configure
 cp .env.example .env
-# Edit .env:
-# POLY_PRIVATE_KEY=0x... (your wallet's private key from Polymarket Settings → Export Wallet)
-# POLY_FUNDER_ADDRESS=0x... (your Polymarket proxy wallet address)
-# TELEGRAM_BOT_TOKEN=... (from @BotFather)
-# TELEGRAM_CHAT_ID=... (your Telegram user ID)
-chmod 600 .env
-```
+nano .env  # Fill in all values
 
-### Step 4: Verify Wallet Type
-```javascript
-// Run this to determine your signatureType
-import { ethers } from 'ethers';
-const provider = new ethers.providers.JsonRpcProvider('https://polygon.drpc.org');
-const code = await provider.getCode(FUNDER_ADDRESS);
-if (code === '0x') sigType = 0; // EOA
-else {
-  try {
-    const safe = new ethers.Contract(FUNDER_ADDRESS, ['function getOwners() view returns (address[])'], provider);
-    await safe.getOwners();
-    sigType = 2; // Gnosis Safe
-  } catch {
-    sigType = 3; // POLY_1271 (upgraded wallet)
-  }
-}
-```
+# 4. Create data directory
+mkdir -p data
 
-### Step 5: Set signatureType in config.mjs
-```javascript
-signatureType: 3,  // 3 = POLY_1271 for upgraded wallets
-```
+# 5. Syntax check
+npm test
 
-### Step 6: Create PM2 Ecosystem Config
-```javascript
-// ecosystem.config.cjs
-module.exports = {
-  apps: [{
-    name: 'polymarket-copier',
-    script: 'index.mjs',
-    env: {
-      POLY_PRIVATE_KEY: '0x...',
-      POLY_FUNDER_ADDRESS: '0x...',
-      TELEGRAM_BOT_TOKEN: '...',
-      TELEGRAM_CHAT_ID: '...',
-    },
-  }],
-};
-```
-
-### Step 7: Start
-```bash
-pm2 start ecosystem.config.cjs
-pm2 logs polymarket-copier --lines 30
+# 6. Start with PM2
+pm2 start index.mjs --name polymarket-copier
 pm2 save
+
+# 7. Monitor startup
+pm2 logs polymarket-copier --lines 50
 ```
 
-### Step 8: Verify
-- Check logs show "✅ WebSocket connected"
-- Check logs show "📡 Subscribed to N token IDs"
-- Check Telegram received startup message with whale list
-- Place a test trade to verify CLOB execution
+## Environment Variables
 
----
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `POLY_PRIVATE_KEY` | Yes (auto-trade) | EOA signer private key (0x + 64 hex chars) |
+| `POLY_FUNDER_ADDRESS` | Yes (auto-trade) | Polymarket proxy wallet address |
+| `TELEGRAM_BOT_TOKEN` | Yes | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | Yes | Your Telegram chat ID |
+| `MORALIS_API_KEY` | No | For on-chain wallet profiling (optional) |
 
-## Configuration Reference
+## Wallet Setup
 
-### Whale Discovery Filters
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `minWinRate` | 0.75 | Minimum win rate (75%) |
-| `minResolvedPositions` | 10 | Minimum resolved positions |
-| `maxAvgEntryPrice` | 0.60 | Max avg entry (filters late scalpers) |
-| `minTotalStake` | 5000 | Minimum total stake ($5K) |
-| `maxTrackedWallets` | 20 | Track top 20 wallets |
-| `refreshIntervalMin` | 60 | Re-rank whales every hour |
+### Getting your private key and funder address
 
-### Signal Monitoring
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `pollIntervalSec` | 30 | Fallback poll interval |
-| `consensusMinWhales` | 3 | 3+ whales = strong signal |
-| `consensusWindowMin` | 10 | Within 10-minute window |
-| `minPositionSizeUsd` | 500 | Ignore trades < $500 |
-| `filterCryptoCandleBots` | true | Skip latency-edge bots |
-| `filterResolutionBufferHours` | 24 | Skip markets resolving <24h |
-| `minMarketLiquidity` | 5000 | Market must have ≥$5k liquidity |
+1. Go to [polymarket.com](https://polymarket.com) and sign in
+2. Click Settings → look for your wallet address
+3. Your **funder address** is the proxy wallet address shown in settings (starts with `0x...`)
+4. Your **private key** is the EOA signer key — export it from your browser wallet (MetaMask, etc.)
+5. The EOA address (derived from the private key) is the signer; the funder address is the proxy
 
-### Execution
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `copyRatio` | 0.05 | Copy 5% of whale's position |
-| `slippageBuffer` | 0.02 | Limit 2% above whale entry |
-| `signatureType` | 3 | POLY_1271 for upgraded wallets |
-| `takeProfitRatios` | [0.85, 0.90] | Scale out at 0.85 and 0.90 |
-| `stopLossPrice` | 0.20 | Hard stop at $0.20 |
-| `trailingStopPct` | 0.10 | 10% trailing stop |
+### signatureType
+
+The config uses `signatureType: 3` (POLY_1271 / EIP-1271). This is correct for Polymarket-upgraded wallets. **Do not change this value.** Other types:
+- `0` = EOA (direct wallet, no proxy)
+- `1` = POLY_PROXY
+- `2` = POLY_GNOSIS_SAFE
+- `3` = POLY_1271 (correct for Polymarket UI-created wallets)
+
+## Verification Checklist
+
+After starting the bot, verify each step in the logs:
+
+1. **Startup banner** prints with `Mode: 🟢 AUTO-TRADE`
+2. **Deployment Safety Report** shows `mode: 🟢 LIVE`
+3. **Whale Discovery** fetches 4 leaderboards, finds ~150 wallets, filters to ~50
+4. **Tier classification** shows ~36 A+, 12 A, 48 B
+5. **Telegram startup alert** received on your phone
+6. **WebSocket connected** — `✅ WebSocket connected`
+7. **Subscribed to N token IDs** — ~1400+ tokens
+8. **CLOB client initialized** — `✅ CLOB client initialized with official SDK (sigType: 3)`
+9. **User WebSocket connected** — for order updates
+10. **Always-on polling started** — every 120s
+11. **First poll completes** — `📊 Poll complete: N new signal(s) detected`
+
+## Common Pitfalls & Lessons Learned
+
+### P1: signal-monitor.mjs incomplete — missing exports (CRITICAL)
+
+**Symptom:** Bot crashes instantly on startup. PM2 shows 24+ restarts. Zero log output. Error: `SyntaxError: The requested module './signal-monitor.mjs' does not provide an export named 'startMonitoring'`
+
+**Root cause:** The file was left incomplete — missing the `startMonitoring()` export function, alert formatters, and the `executeSignal` import that wires signals to trade execution.
+
+**Fix:** Ensure `signal-monitor.mjs` exports `startMonitoring(whales)` and imports `executeSignal` from `clob-executor.mjs`. See the file in this repo for the complete implementation.
+
+**Lesson:** Always run `npm test` (syntax check) before deploying. A syntax check catches missing exports.
+
+### P2: CLOB API error responses not handled (CRITICAL)
+
+**Symptom:** Orders placed but `orderID=undefined, status=400`. Bot registers phantom trades. Reconciliation loop spams errors every 15s about "order undefined not in open orders."
+
+**Root cause:** The CLOB API returns `{ error: "...", status: 400 }` on rejected orders (e.g., invalid token, amount too small, market resolved). The `placeOrder` function didn't check for `response.success` or `response.error` — it just logged `response.orderID` (which is undefined in error responses) and continued as if the order succeeded.
+
+**Fix:** `placeOrder` now checks `response.success` and `response.error`, throws on error responses. `executeSignal` catches the throw and alerts via Telegram. Reconciliation filters out `undefined`/`null` orderIds.
+
+**Lesson:** Always validate API response shapes. Don't assume success. Check for error fields before accessing success fields.
+
+### P3: Gamma API field name mismatch — `minimumTickSize` vs `orderPriceMinTickSize`
+
+**Symptom:** Orders might fail on 0.001-tick markets because tick size defaults to 0.01.
+
+**Root cause:** The Gamma API returns `orderPriceMinTickSize`, not `minimumTickSize`. The code referenced `market.minimumTickSize` which was always `undefined`, falling back to `'0.01'`.
+
+**Fix:** Use `market.orderPriceMinTickSize || market.minimumTickSize || '0.01'` everywhere.
+
+**Lesson:** API field names change. Always verify against actual API responses with `curl`.
+
+### P4: Moralis `top-gainers` endpoint deprecated/broken (CRITICAL for crew copy-trader)
+
+**Symptom:** Crew copy-trader polls 0 wallets. Fingerprinting produces empty crew cache. Bot runs cycles doing nothing.
+
+**Root cause:** The Moralis `erc20/{token}/top-gainers` endpoint returns HTTP 500 "Unknown error occurred" for BSC tokens and empty results for ETH tokens. The endpoint appears deprecated or broken.
+
+**Fix:** Replaced with the `erc20/{token}/transfers` endpoint (which works reliably). The new implementation fetches recent transfers, identifies wallets that received tokens from DEX entities (Uniswap, PancakeSwap, etc.), and aggregates them as buyer wallets.
+
+**Important:** The Moralis transfers endpoint has a max `limit` of 100. Using `limit=200` returns 0 results silently. Always use `limit=100` or less.
+
+**Lesson:** Don't depend on a single API endpoint. Have fallbacks. Test endpoints with `curl` before building on them.
+
+### P5: Moralis API limit parameter silently capped at 100
+
+**Symptom:** `limit=200` returns 0 results. `limit=100` returns 100 results. `limit=50` returns 50 results.
+
+**Root cause:** Moralis silently rejects requests with `limit > 100` on certain endpoints, returning empty results instead of an error.
+
+**Fix:** Always use `limit=100` or less on Moralis API endpoints.
+
+### P6: PM2 logs empty after `pm2 flush`
+
+**Symptom:** After `pm2 flush`, logs remain at 0 bytes even though the process is running and producing output.
+
+**Root cause:** PM2 log flushing can sometimes desync from the process's stdout/stderr streams.
+
+**Fix:** Use `pm2 delete` + `pm2 start` instead of `pm2 flush` + `pm2 restart` to fully recreate the process and its log handles.
+
+### P7: Private key validation fails when running test scripts
+
+**Symptom:** `Error: invalid private key, expected hex or 32 bytes, got string` when running `node -e '...'` test scripts.
+
+**Root cause:** The `config.mjs` validation runs at module load time. If `dotenv` isn't configured before importing `config.mjs`, the env vars are empty and execution gets disabled. The validation regex then sees an empty string as invalid.
+
+**Fix:** Always use `import "dotenv/config"` as the FIRST import in any test script, before importing `config.mjs`.
+
+## Architecture Details
+
+### Signal Flow
+
+```
+Whale enters market
+    ↓
+signal-monitor.mjs detects new position (via polling or WS)
+    ↓
+processNewPosition() classifies signal:
+  - Single whale → WHALE_ENTRY
+  - 2+ whales same market → CONSENSUS
+  - A+ tier alone → ELITE_SHARP
+    ↓
+sendTelegramHTML() — alert sent to Telegram
+    ↓
+executeSignal() called (if execution enabled for signal type)
+    ↓
+checkRisk() — risk gate (max positions, daily loss, etc.)
+    ↓
+checkEntryQuality() — spread, slippage, depth checks
+    ↓
+placeOrder() — CLOB API order placement
+    ↓
+registerTrade() — stored in risk_state.json
+    ↓
+Telegram alert with order ID
+    ↓
+manageExits() — runs every 30s, monitors TP/SL/trailing
+    ↓
+reconcileOrders() — runs every 15s, checks fill status
+```
+
+### State Files
+
+| File | Purpose | Format |
+|------|---------|--------|
+| `data/whales.json` | Tracked whale wallets | JSON array |
+| `data/monitor_state.json` | Known positions per whale | JSON (Sets serialized as arrays) |
+| `data/risk_state.json` | Open positions, trade history, daily stats | JSON |
+| `data/pnl_log.jsonl` | Trade-level PnL log | JSONL |
+| `data/pnl_daily.jsonl` | Daily PnL summaries | JSONL |
 
 ### Risk Management
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `maxPositionSizeUsd` | 5 | Max $5 per trade |
-| `maxDailyTrades` | 5 | Max 5 trades/day |
-| `maxConcurrentPositions` | 8 | Max 8 open at once |
-| `maxConcurrentPerCategory` | 3 | Max 3 in same category |
-| `maxPortfolioDrawdownPct` | 0.15 | Pause at 15% drawdown |
-| `dailyLossLimitUsd` | 15 | Stop if daily loss > $15 |
-| `cooldownAfterLossMin` | 30 | 30min cooldown after loss |
 
----
+The bot has multiple safety layers:
 
-## API Reference
+1. **Per-trade cap:** $5 max per trade (5% of $99 bankroll)
+2. **Daily trade cap:** 5 trades/day
+3. **Concurrent position cap:** 8 positions max
+4. **Category cap:** 3 per category max
+5. **Drawdown circuit breaker:** 15% portfolio drawdown → pause
+6. **Min balance:** $10 → stop trading
+7. **Daily loss limit:** $15 → stop trading
+8. **Cooldown:** 30min after any loss
+9. **A+ standalone cap:** $2 max for elite sharp standalone trades
+10. **Entry quality gate:** spread ≤6%, slippage ≤4%, depth sufficient, price ≤0.92
 
-### Polymarket APIs
+### Exit Logic
 
-| API | Base URL | Auth | Purpose |
-|-----|----------|------|---------|
-| Gamma | `gamma-api.polymarket.com` | None | Markets, events, search |
-| Data | `data-api.polymarket.com` | None | Positions, trades, leaderboard |
-| CLOB | `clob.polymarket.com` | Wallet | Order placement, orderbook, prices |
-| WebSocket | `ws-subscriptions-clob.polymarket.com/ws/market` | None | Real-time trade data |
+- Scale out at 0.85 and 0.90 (50% at first TP)
+- Hard stop at 0.20
+- 10% trailing stop from peak
+- Hold to resolution if none of above hit
 
-### Key Endpoints
+## Monitoring Commands
+
+```bash
+# Check status
+pm2 describe polymarket-copier
+
+# Recent logs
+pm2 logs polymarket-copier --lines 100
+
+# Check positions
+cat data/risk_state.json | python3 -m json.tool | head -50
+
+# Check PnL log
+tail -20 data/pnl_log.jsonl | python3 -m json.tool
+
+# Check whale cache
+cat data/whales.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{len(d)} whales')"
+
+# Check monitor state
+cat data/monitor_state.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'{len(d[\"knownPositions\"])} tracked wallets')"
 ```
-GET /v1/leaderboard?category=OVERALL&timePeriod=ALL&orderBy=PNL&limit=50
-GET /positions?user={address}&sizeThreshold=1&limit=500
-GET /closed-positions?user={address}&limit=500
-GET /trades?market={conditionId}&limit=100
-GET /markets?active=true&closed=false&limit=100
-GET /midpoint?token_id={tokenId}
-GET /book?token_id={tokenId}
-```
-
-### WebSocket Subscription (Market Channel)
-```json
-{
-  "assets_ids": ["token_id_1", "token_id_2", ...],
-  "type": "market"
-}
-```
-
-### WebSocket Events
-- `book` — Full orderbook snapshot
-- `price_change` — Price level updates
-- `last_trade_price` — Trade executions
-- `tick_size_change` — Tick size changes
-
----
 
 ## Troubleshooting
 
-### "maker address not allowed, please use the deposit wallet flow"
-**Cause:** Wrong signatureType for your wallet type.
-**Fix:** Use signatureType=3 (POLY_1271) for upgraded Polymarket wallets. Use signatureType=2 for Gnosis Safe. Use signatureType=0 for EOA.
+### Bot not producing any alerts
 
-### "Invalid order payload"
-**Cause:** Usually a fee rate issue or wrong tick size.
-**Fix:** Don't hardcode `feeRateBps`. Let the SDK determine it. Make sure `tickSize` matches the market's `orderPriceMinTickSize`.
+1. Check PM2 status: `pm2 describe polymarket-copier`
+2. Check logs: `pm2 logs polymarket-copier --lines 100`
+3. If logs are empty → delete and restart: `pm2 delete polymarket-copier && pm2 start index.mjs --name polymarket-copier`
+4. If crashes on startup → run `npm test` to check syntax
+5. If "missing export" error → the file is incomplete, re-clone from repo
 
-### WebSocket 404
-**Cause:** Wrong URL path.
-**Fix:** Use `/ws/market` (not `/ws`). Market channel is public (no auth). User channel is at `/ws/user` (requires API creds).
+### Orders failing with status 400
 
-### "WebSocket is not defined"
-**Cause:** Node v20 doesn't have global WebSocket.
-**Fix:** `npm install ws` and `import { WebSocket } from 'ws';`
+1. Check if the token ID is valid (market not resolved): `curl -s 'https://clob.polymarket.com/tick-size?token_id=TOKENID'`
+2. If "market not found" → the market has resolved, token ID is stale
+3. Check order size: minimum is $1 for marketable orders
+4. Check if wallet has sufficient USDC balance
 
-### Balance shows 0 but trades work
-**Cause:** Known quirk with proxy wallets. The `getBalanceAllowance` endpoint doesn't correctly report balance for POLY_1271 wallets.
-**Fix:** Don't rely on balance endpoint. Test with actual order placement.
+### Telegram alerts not arriving
 
-### Telegram 401 Unauthorized
-**Cause:** Bot token not passed to PM2 environment.
-**Fix:** Use `ecosystem.config.cjs` with `env:` block to pass `TELEGRAM_BOT_TOKEN` explicitly. PM2 doesn't auto-load `.env` files.
+1. Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`
+2. Test: `curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" -d chat_id=<CHAT_ID> -d text=test`
+3. Check for HTML formatting errors in logs (unclosed tags cause 400 errors)
 
----
+### Moralis API errors
 
-## File Structure
-```
-polymarket-whale-copier/
-├── index.mjs              # Main entry — orchestrates all 5 layers
-├── config.mjs             # All configuration
-├── polymarket-api.mjs     # Gamma + Data + CLOB API client
-├── whale-discovery.mjs    # Layer 1: Leaderboard scan + wallet scoring
-├── signal-monitor.mjs     # Layer 2: WebSocket + polling fallback
-├── clob-executor.mjs      # Layer 3: Order placement + exit management
-├── risk-manager.mjs       # Layer 4: Circuit breakers + position limits
-├── telegram-bot.mjs       # Layer 5: Telegram alerts + daily summary
-├── package.json
-├── .env.example
-├── .gitignore
-├── README.md
-└── DEPLOYMENT.md          # This file
-```
+1. Verify API key is valid: `curl -H 'X-API-Key: <KEY>' 'https://deep-index.moralis.io/api/v2.2/wallets/0x.../history?chain=bsc&limit=1'`
+2. If "Invalid signature" → key is expired or invalid
+3. If 429 → rate limited, increase delays between calls
+4. Never use `limit > 100` — Moralis silently returns empty results
 
----
+## Crew Copy-Trader (separate engine)
 
-## Moralis Integration (Not Yet Implemented)
+The crew copy-trader is a separate engine at `/app/trading_engine/crew_copytrader.mjs`. It:
 
-Moralis is configured in `config.mjs` but NOT used in the engine code. Planned uses:
-1. Bot vs human detection (transaction timing analysis)
-2. On-chain PnL verification (verify leaderboard claims)
-3. pUSD flow tracking (detect whales moving funds)
-4. Wallet profiling (human vs automated trader)
+1. **Fingerprints** crew wallets by fetching token transfers across 77 rug coins
+2. Identifies wallets appearing on 2+ rug coins as "crew"
+3. Monitors crew wallet activity via Moralis wallet history API
+4. Detects consensus buys/sells across crew members
+5. Runs in shadow mode (alerts only) by default
 
-To implement, add a `moralis-integration.mjs` module that queries Moralis Polygon API for each tracked whale's transaction history and exposes the results to the signal monitor and whale discovery layers.
+Key files:
+- `core/moralis_wallets.mjs` — Moralis API client (transfers-based fingerprinting)
+- `core/tx_classifier.mjs` — Transaction classification (BUY/SELL/intent confidence)
+- `core/crew_scorer.mjs` — Crew wallet scoring
+- `core/wallet_clusterer.mjs` — Wallet clustering (identifies related wallets)
 
----
-
-## Contact / Maintenance
-- GitHub: `patrickabedin/polymarket-glm`
-- Server: DO droplet `178.128.242.13` (SSH key: `~/.ssh/do_skynet`)
-- PM2: `polymarket-copier` (id 68)
-- Telegram: @skynet_cyberdin_bot
-- Bankroll: $99.26 (starting)
-- Bet size: $5/trade (5% of bankroll)
-
----
-
-*Last updated: 2026-06-27*
-*Built by: KiloClaw (SKYNET)*
+PM2 process: `crew-copytrader`
