@@ -66,16 +66,29 @@ The scale-out at TP1 locks in profits on half the position while letting the res
 - **Order fill timeout:** 30 minutes → cancel
 - **Exit order timeout:** 10 minutes → reprice at current best bid (max 3 retries)
 
-### Daily Threshold — Protect the Day
-When the portfolio reaches **+30% gain for the day** ($99 → $129), the bot sells everything and pauses. This prevents overtrading and protects profits. The threshold is intentionally set at 30% because:
+### Operation Protect the Day
 
+**Daily Take-Profit:** When realized PnL reaches **+$30** (30% of $99 bankroll), the bot:
+1. Pauses all trading immediately
+2. Sends a Telegram alert with the day's PnL and stats
+3. Resumes automatically at midnight UTC with a fresh daily slate
+
+**Daily Loss Limit:** When realized PnL drops to **-$30** (30% of $99 bankroll), the bot:
+1. Pauses all trading immediately
+2. Sends a Telegram alert with the day's PnL and stats
+3. Resumes automatically at midnight UTC
+
+**New Day Reset:** At midnight UTC, the bot:
+1. Resets daily stats (trades, wins, losses, PnL)
+2. Resets `portfolioPeak` to current equity (prevents stale peaks from blocking trades)
+3. Unpauses trading
+4. Sends a Telegram alert confirming the reset with previous day's PnL
+
+**Why 30%?**
 - At 30% daily gain, the win rate edge has already been captured
-- Continuing to trade increases exposure to variance (one bad trade can erase gains)
-- The bot makes ~20-30 trades per day; each trade is $2-10. A 30% gain = $30 profit on $99
-- Going for more (e.g., 50%) would require holding through more trades, increasing the probability of a reversal
-- 30% compounded daily doubles the bankroll in ~3 days — that's already aggressive
-
-**Recommendation:** Keep the 30% daily threshold. It balances aggression with protection. If you want to be more aggressive, raise to 40% — but never remove the cap entirely. Without a daily stop, a winning day can turn into a losing day in 2-3 bad trades.
+- Continuing to trade increases exposure to variance — 2-3 bad trades can erase gains
+- 30% compounded daily doubles the bankroll in ~3 days, which is already aggressive
+- Without a daily cap, a winning day can become a losing day in 2-3 bad trades
 
 ## Quick Start (5 minutes)
 
@@ -195,9 +208,11 @@ You should see the startup banner, whale discovery (151 wallets analyzed, ~50 tr
 - Max 6 per category
 - 25% max portfolio drawdown → pause
 - $10 min balance → stop
-- $30 daily loss limit → stop
+- **$30 daily loss limit → stop for the day (Operation Protect the Day)**
+- **$30 daily take-profit → stop for the day (Operation Protect the Day)**
 - 30min cooldown after losses
 - Portfolio take-profit at +30% → sell everything
+- Auto-reset at midnight UTC with Telegram notification
 - State: `data/risk_state.json`
 
 ### Layer 5: Telegram Alerts (`telegram-bot.mjs`)
@@ -258,7 +273,8 @@ risk: {
   maxConcurrentPerCategory: 6,
   maxPortfolioDrawdownPct: 0.25, // 25% drawdown → pause
   minBalanceUsd: 10,
-  dailyLossLimitUsd: 30,
+  dailyLossLimitUsd: 30,        // PROTECT THE DAY: stop at -$30 daily loss
+  dailyTakeProfitUsd: 30,       // PROTECT THE DAY: stop at +$30 daily gain
   cooldownAfterLossMin: 0,
 }
 ```
