@@ -283,3 +283,53 @@ Key files:
 - `core/wallet_clusterer.mjs` — Wallet clustering (identifies related wallets)
 
 PM2 process: `crew-copytrader`
+
+---
+
+## Exit Logic (Updated 2026-06-29)
+
+### Priority Order
+1. **Whale Exit** (primary) — polls the copied whale's portfolio each cycle. If the whale no longer holds the market, we sell immediately. This is the #1 exit signal.
+2. **TP1/TP2 Scale-out** — sell 50% at $0.85, sell remaining at $0.90
+3. **Hard Stop Loss** — exit at $0.30 (max 33% loss per position)
+4. **Trailing Stop** — 7% from peak price (locks in gains when price reverses)
+5. **No Hold-to-Resolution** — disabled. If nothing triggers, position stays open until whale exits or a stop hits.
+
+### Why Whale Exit?
+The bot copies whale entries. It should also copy whale exits. Trailing stops and TP levels are guesses — the whale knows when to exit better than we do. This also avoids the problem of riding a winner all the way back to break-even.
+
+### Previous Exit Issues (Fixed)
+- Trailing stop was 10% → gave back entire moves (bought $0.46, peaked $0.54, exited at $0.46 = $0 PnL)
+- Hard stop was $0.20 → lost 56% per stop loss
+- Hold-to-resolution was enabled → held bags forever if no stop triggered
+- No whale exit tracking → bot held positions after whales already sold
+
+## Cooldown Rules
+
+| Rule | Value | Description |
+|------|-------|-------------|
+| Loss cooldown | 30 min | After any losing trade, 30min cooldown before next trade |
+| Daily trade limit | 5 trades | Max 5 order attempts per day |
+| Daily loss limit | $15 | Stop trading if daily losses exceed $15 |
+| Min balance | $10 | Stop trading if balance drops below $10 |
+| Max drawdown | 15% | Pause trading if portfolio drops 15% from peak |
+
+## Concurrent Position Limits
+
+| Rule | Value |
+|------|-------|
+| Max concurrent positions | 8 |
+| Max per category | 3 (politics, sports, crypto, etc.) |
+| Max position size | $5 (5% of $99 bankroll) |
+| A+ standalone max | $2 |
+
+## Risk Gates (Entry)
+- Spread ≤ 6%
+- Slippage ≤ 4% above whale entry
+- Orderbook depth sufficient
+- Max entry price ≤ $0.92
+- Cooldown not active
+- Daily trade limit not exceeded
+- Daily loss limit not exceeded
+- Min balance maintained
+- Max concurrent positions not exceeded
