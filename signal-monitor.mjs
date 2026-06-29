@@ -7,6 +7,7 @@ import { CONFIG } from './config.mjs';
 import { Data, Gamma, CLOB, retry, rateLimited } from './polymarket-api.mjs';
 import { sendTelegram, sendTelegramHTML } from './telegram-bot.mjs';
 import { executeSignal } from './clob-executor.mjs';
+import { onPriceUpdate, getRegisteredTokenIds } from './ws-exit-monitor.mjs';
 import fs from 'fs';
 import path from 'path';
 import { WebSocket } from 'ws';
@@ -76,11 +77,13 @@ function saveState() {
 }
 
 function isMarketNearResolution(position) {
+  // MAX resolution gate: skip markets that resolve MORE than 24h from now
   if (!CONFIG.monitoring.filterMarketsNearResolution) return false;
   if (!position.endDate) return false;
   const endDate = new Date(position.endDate);
   const hoursUntil = (endDate - Date.now()) / 3600000;
-  return hoursUntil < CONFIG.monitoring.filterResolutionBufferHours;
+  if (hoursUntil > CONFIG.monitoring.maxResolutionHours) return true;
+  return false;
 }
 
 async function detectCryptoCandleBot(conditionId) {
@@ -400,14 +403,25 @@ function connectWebSocket(whales) {
   ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      // WebSocket messages are price-change events, not position changes.
-      // The actual whale position detection is done via polling.
-      // WS is used for real-time price awareness on subscribed tokens.
-      if (msg.type === 'book' || msg.type === 'price_change' || msg.type === 'tick_size_change') {
-        // Price update — could be used for real-time PnL tracking
-        // For now, just log occasionally
-        if (Math.random() < 0.01) {
-          console.log(`📊 WS price update on token ${msg.asset_id?.slice(0, 8)}...`);
+      if (msg.type === 'book' || msg.type === 'price_change') {
+        const tokenId = msg.asset_id;
+        // Extract best bid from the message
+        let bestBid = null;
+        if (msg.bids && Array.isArray(msg.bids) && msg.bids.length > 0) {
+          // Sort bids by price descending, take highest
+          const sortedBids = msg.bids.map(b => parseFloat(b.price)).sort((a, b) => b - a);
+          bestBid = sortedBids[0];
+        } else if (msg.price) {
+          bestBid = parseFloat(msg.price);
+        }
+        const ts = msg.timestamp ? parseInt(msg.timestamp) : Date.now();
+        
+        // Feed to WS exit monitor for real-time exit checks
+        if (tokenId && bestBid) {
+          const exited = await onPriceUpdate(tokenId, bestBid, ts);
+          if (exited) {
+            console.log(`⚡ WS exit triggered for token ${tokenId.slice(0, 12)}...`);
+          }
         }
       }
     } catch (err) {
@@ -520,6 +534,18 @@ async function pollAllWhales(whales) {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
+export function subscribeToToken(tokenId) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'market', assets_ids: [tokenId] }));
+    console.log(`📡 WS subscribed to position token ${tokenId.slice(0, 12)}...`);
+  }
+}
+
+export function unsubscribeFromToken(tokenId) {
+  // Polymarket WS doesn't have explicit unsubscribe — we just stop monitoring
+  // The token will be removed from the exit monitor's registry
+}
+
 export async function startMonitoring(whales) {
   console.log(`\n📡 Signal Monitor starting with ${whales.length} whales`);
 
@@ -543,6 +569,14 @@ export async function startMonitoring(whales) {
     saveState();
   }, 60000); // every 1min
 
+  // Re-subscribe to open position tokens after WS reconnect
+  const positionTokens = getRegisteredTokenIds();
+  if (positionTokens.length > 0) {
+    ws.send(JSON.stringify({ type: 'market', assets_ids: positionTokens }));
+    console.log(`📡 Re-subscribed to ${positionTokens.length} open position tokens for WS exit monitoring`);
+  }
+
   // Keep the process alive (this function blocks forever)
   return new Promise(() => {});
 }
+

@@ -8,6 +8,8 @@ import { CLOB, Gamma, Data, retry, rateLimited } from './polymarket-api.mjs';
 import { checkRisk, registerTrade, registerExit, setExitOrderMetadata, getOpenPositions, getAllStoredPositions, updatePositionPrice, updatePositionStatus, markTpHit, updatePositionFill, setPendingExitSize, incrementExitRetry, getExitRetries, isEventProcessed, markEventProcessed, makeEventHash } from './risk-manager.mjs';
 import { sendTelegram, sendTelegramHTML } from './telegram-bot.mjs';
 import { logTrade, logExit, logStatusTransition, logBlockedTrade, logSkippedTrade } from './pnl-logger.mjs';
+import { logEntryPattern, logExitPattern, logSkippedPattern } from './pattern_logger.mjs';
+import { registerPosition, unregisterPosition } from './ws-exit-monitor.mjs';
 import { WebSocket } from 'ws';
 import fs from 'fs';
 import path from 'path';
@@ -418,6 +420,13 @@ export async function executeSignal(signal) {
       });
     }
 
+    // Log entry pattern for optimization analysis
+    try {
+      logEntryPattern({ ...trade, market: market.title, conditionId: market.conditionId }, {
+        market, whale, whaleEntryPrice, marketData,
+      });
+    } catch (e) { console.warn('Pattern logger error:', e.message); }
+
     // Alert
     if (CONFIG.telegram.alertOnTrade) {
       const whaleName = consensus ? `${consensus.whaleCount} whales (consensus)` : whale.username;
@@ -514,6 +523,7 @@ export async function reconcileOrders() {
                 });
                 if (CONFIG.pnlLogger.enabled && result.booked) {
                   logExit(pos.orderId, { size: sizeMatched, price: parseFloat(orderDetail?.price || pos.exitPrice || 0), reason: pos.exitReason || 'Partial exit fill', sellOrderId: checkOrderId });
+          try { logExitPattern(pos.orderId, { size: sizeMatched, price: parseFloat(orderDetail?.price || pos.exitPrice || 0), reason: pos.exitReason || 'Partial exit fill', pnlUsd: (parseFloat(orderDetail?.price || pos.exitPrice || 0) - pos.entryPrice) * sizeMatched, peakPrice: pos.peakPrice }, { entryPrice: pos.entryPrice, whaleUsername: pos.whaleUsername, whaleTier: pos.whaleTier, signalType: pos.signalType, category: pos.category, peakPrice: pos.peakPrice }); } catch {}
                 }
               }
             }
@@ -563,9 +573,11 @@ export async function reconcileOrders() {
           markEventProcessed(pos.orderId, exitEventHash);
           if (CONFIG.pnlLogger.enabled && result.booked) {
             logExit(pos.orderId, { size: fillSize, price: fillPrice, reason: pos.exitReason || 'Exit order filled', sellOrderId: checkOrderId });
+          try { logExitPattern(pos.orderId, { size: fillSize, price: fillPrice, reason: pos.exitReason || 'Exit order filled', pnlUsd: (fillPrice - pos.entryPrice) * fillSize, peakPrice: pos.peakPrice }, { entryPrice: pos.entryPrice, whaleUsername: pos.whaleUsername, whaleTier: pos.whaleTier, signalType: pos.signalType, category: pos.category, peakPrice: pos.peakPrice }); } catch {}
             logStatusTransition(pos.orderId, previousStatus, 'EXIT_FILLED', pos.market);
           }
           console.log(`✅ Exit order ${checkOrderId} FILLED (${pos.market})`);
+          try { onPositionClosed(pos.orderId); } catch (e) { console.warn("WS-EXIT unregister error:", e.message); }
           // Rich exit filled alert with win/loss verdict
           const exitPnl = (fillPrice - (pos.entryPrice || 0)) * fillSize;
           const exitPnlPct = pos.entryPrice ? ((fillPrice - pos.entryPrice) / pos.entryPrice * 100) : 0;
@@ -665,6 +677,7 @@ export async function reconcileOrders() {
             logStatusTransition(pos.orderId, previousStatus, 'FILLED', pos.market);
           }
           console.log(`✅ Order ${pos.orderId} FILLED (${pos.market}) size=${fillSize || pos.size}`);
+          try { onPositionFilled(pos); } catch (e) { console.warn("WS-EXIT register on fill error:", e.message); }
           await sendTelegramHTML([
             '✅ <b>ORDER FILLED</b>',
             '',
@@ -795,6 +808,7 @@ async function handleUserWsMessage(m) {
             });
             if (CONFIG.pnlLogger.enabled && result.booked) {
               logExit(entryOrderId, { size: actualFillSize, price: actualFillPrice, reason: pos.exitReason || 'Exit order filled', sellOrderId: orderId });
+            try { logExitPattern(entryOrderId, { size: actualFillSize, price: actualFillPrice, reason: pos.exitReason || 'Exit order filled', pnlUsd: (actualFillPrice - pos.entryPrice) * actualFillSize, peakPrice: pos.peakPrice }, { entryPrice: pos.entryPrice, whaleUsername: pos.whaleUsername, whaleTier: pos.whaleTier, signalType: pos.signalType, category: pos.category, peakPrice: pos.peakPrice }); } catch {}
             }
           }
         } else {
@@ -858,6 +872,7 @@ async function handleUserWsMessage(m) {
           });
           if (CONFIG.pnlLogger.enabled && result.booked) {
             logExit(entryOrderId, { size: confirmFillSize, price: confirmFillPrice, reason: pos.exitReason || 'Exit order confirmed', sellOrderId: orderId });
+          try { logExitPattern(entryOrderId, { size: confirmFillSize, price: confirmFillPrice, reason: pos.exitReason || 'Exit order confirmed', pnlUsd: (confirmFillPrice - pos.entryPrice) * confirmFillSize, peakPrice: pos.peakPrice }, { entryPrice: pos.entryPrice, whaleUsername: pos.whaleUsername, whaleTier: pos.whaleTier, signalType: pos.signalType, category: pos.category, peakPrice: pos.peakPrice }); } catch {}
           }
         }
       } else {
@@ -1250,4 +1265,67 @@ async function exitPosition(pos, size, price, reason) {
     console.error(`❌ Exit failed for ${pos.market}: ${err.message}`);
     return { submitted: false };
   }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  WS EXIT — Real-time exit triggered by WebSocket price monitor
+//  Called from ws-exit-monitor.mjs when TP/SL/trailing thresholds are hit
+// ═══════════════════════════════════════════════════════════════════════════════
+export async function exitPositionWS(orderId, size, price, reason, tokenId) {
+  const pos = getOpenPositions().find(p => p.orderId === orderId);
+  if (!pos) {
+    console.warn(`[WS-EXIT] Position ${orderId} not found — may have already been exited`);
+    return { submitted: false, reason: 'position not found' };
+  }
+
+  if (pos.status && pos.status.startsWith('EXIT_')) {
+    console.log(`[WS-EXIT] Position ${orderId} already exiting (${pos.status}) — skipping`);
+    return { submitted: false, reason: 'already exiting' };
+  }
+
+  console.log(`[WS-EXIT] Placing SELL: ${size} @ ${price} (${reason})`);
+
+  const result = await exitPosition(pos, size, price, reason);
+
+  if (result && result.submitted) {
+    if (reason.includes('TP1')) {
+      markTpHit(orderId, 'tp1Hit');
+      setPendingExitSize(orderId, (pos.pendingExitSize || 0) + result.size);
+    }
+    if (reason.includes('TP2')) {
+      markTpHit(orderId, 'tp2Hit');
+    }
+    console.log(`[WS-EXIT] ✅ Exit submitted for ${orderId}`);
+  } else {
+    console.warn(`[WS-EXIT] Exit NOT submitted for ${orderId}`);
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  WS POSITION LIFECYCLE — register/unregister positions for real-time monitoring
+// ═══════════════════════════════════════════════════════════════════════════════
+export function onPositionFilled(pos) {
+  try {
+    const tokenId = pos.tokenId || pos.assetId;
+    if (tokenId) {
+      registerPosition(tokenId, pos, CONFIG.execution.exitLogic);
+      // Subscribe to WS for this token — import dynamically to avoid circular dep
+      import('./signal-monitor.mjs').then(sm => {
+        if (sm.subscribeToToken) sm.subscribeToToken(tokenId);
+      }).catch(() => {});
+    }
+  } catch (e) { console.warn('[WS-EXIT] Register error:', e.message); }
+}
+
+export function onPositionClosed(orderId) {
+  try {
+    const pos = getAllStoredPositions().find(p => p.orderId === orderId);
+    const tokenId = pos?.tokenId || pos?.assetId || '';
+    if (tokenId) {
+      unregisterPosition(tokenId);
+    }
+  } catch (e) { console.warn('[WS-EXIT] Unregister error:', e.message); }
 }
